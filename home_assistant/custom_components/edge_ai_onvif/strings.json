@@ -1,0 +1,8 @@
+{
+  "title": "Edge AI ONVIF Rule Sync",
+  "config": {
+    "step": {"user": {"title": "Synchronize Edge AI rule names", "description": "Select an existing Edge-AI-IPC ONVIF integration. Video and sensor states continue to use native ONVIF. Rule names and deletions are synchronized automatically.", "data": {"onvif_entry_id": "ONVIF gateway"}}},
+    "abort": {"no_onvif_gateway": "Add Edge-AI-IPC through the ONVIF integration first.", "already_configured": "Rule synchronization is already configured for this gateway."}
+  },
+  "issues": {"migration_conflict": {"title": "ONVIF rule entity migration needs review", "description": "Several existing entities refer to one Edge AI rule. They have been retained to protect automations: {entities}. Keep the desired entity ID before retrying migration."}}
+}

@@ -1,0 +1,27 @@
+[Unit]
+Description=AIX5 RDK X5 AI Video Analyzer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@RUN_USER@
+Group=@RUN_GROUP@
+WorkingDirectory=@APP_DIR@
+Environment=AIX5_DATA_DIR=@DATA_DIR@
+Environment=AIX5_CAPTURE_BIN=@APP_DIR@/native/rdk_capture_mm
+Environment=AIX5_ENCODER_LIB=@APP_DIR@/native/librdk_h264_encoder.so
+Environment=AIX5_MEDIAMTX_BIN=@APP_DIR@/native/mediamtx
+Environment=AIX5_PORT=@PORT@
+Environment=AIX5_BASE_URL=@BASE_URL@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@VENV_DIR@/bin/python -m uvicorn aix5_ai.main:app --app-dir @APP_DIR@ --host 0.0.0.0 --port @PORT@
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

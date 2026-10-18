@@ -1,0 +1,83 @@
+# Local environment notes and historical bring-up reports (keep on disk).
+/硬件及环境说明*.md
+/参考文档.md
+/阶段*实测报告*.md
+/tools/phase0_probe.py
+
+# Intermediate validation reports, raw results and diagnostic screenshots.
+# Public screenshots live in img/; reusable tests and verification tools stay versioned.
+/docs/*-20??-??-??.md
+/docs/*.json
+/docs/*.png
+/docs/*.jpg
+/docs/*.jpeg
+/reports/
+/artifacts/
+/backups/
+/tmp/
+/test-results/
+/playwright-report/
+
+# Python environments, caches and package/build output.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Runtime data and credentials. Never commit a live database or camera config.
+data/
+.env
+.env.*
+!.env.example
+initial-admin.txt
+.onvif-secret.key
+.onvif-key-*
+mediamtx.json
+test_source.json
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.pid
+*.sock
+*.pem
+*.key
+credentials.json
+*-credentials.json
+*-token.json
+*-tokens.json
+
+# Board-specific generated executables, shared libraries and model weights.
+*.so
+*.dylib
+*.o
+*.bin
+native/rdk_capture
+native/rdk_capture_mm
+native/rdk_video_stream
+native/mediamtx
+native/*.next
+native/*.next.*
+
+# Editor and OS metadata.
+.DS_Store
+._*
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

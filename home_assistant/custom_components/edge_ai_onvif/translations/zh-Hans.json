@@ -1,0 +1,8 @@
+{
+  "title": "Edge AI ONVIF 规则同步",
+  "config": {
+    "step": {"user": {"title": "同步 Edge AI 规则名称", "description": "选择已经添加的 Edge-AI-IPC ONVIF 集成。视频和传感器状态继续使用原生 ONVIF；规则名称和删除操作会自动同步。", "data": {"onvif_entry_id": "ONVIF 网关"}}},
+    "abort": {"no_onvif_gateway": "请先通过 ONVIF 集成添加 Edge-AI-IPC。", "already_configured": "此网关已经启用规则同步。"}
+  },
+  "issues": {"migration_conflict": {"title": "ONVIF 规则实体迁移需要检查", "description": "以下多个实体对应同一条规则，为保护自动化，已暂时保留：{entities}。请确定需要保留的实体 ID 后重试迁移。"}}
+}

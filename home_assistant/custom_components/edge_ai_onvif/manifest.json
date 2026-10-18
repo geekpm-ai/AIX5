@@ -1,0 +1,12 @@
+{
+  "domain": "edge_ai_onvif",
+  "name": "Edge AI ONVIF Rule Sync",
+  "version": "0.1.0",
+  "config_flow": true,
+  "documentation": "https://www.home-assistant.io/integrations/onvif/",
+  "dependencies": ["onvif"],
+  "codeowners": [],
+  "requirements": [],
+  "iot_class": "local_polling",
+  "integration_type": "helper"
+}

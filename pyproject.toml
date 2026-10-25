@@ -13,7 +13,6 @@ dependencies = [
   "argon2-cffi>=23,<26",
   "cryptography>=44,<51",
   "onvif-zeep>=0.2.12,<1",
-  "paho-mqtt>=2,<3",
   "aiortc>=1.15,<2",
   "numpy>=1.23,<3",
   "scipy>=1.9,<2",

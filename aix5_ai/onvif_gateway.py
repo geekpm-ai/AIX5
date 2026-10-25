@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import html
+import ipaddress
 import json
 import socket
 import time
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from urllib.parse import urlsplit, urlunsplit
 
 from .onvif_events import OnvifEventHub, parse_xsd_duration
 
@@ -31,6 +33,47 @@ TNS1 = "http://www.onvif.org/ver10/topics"
 WSTOP = "http://docs.oasis-open.org/wsn/t-1"
 WSNT = "http://docs.oasis-open.org/wsn/b-2"
 DEVICE_NAME = "Edge-AI-IPC"
+
+
+def _local_ipv4() -> str | None:
+    """Return the IPv4 address selected for the machine's default route.
+
+    ONVIF discovery runs before an HTTP request exists, so there is no
+    request ``Host`` header from which to build an XAddr.  Connecting a UDP
+    socket does not send a packet; it only asks the kernel which local
+    interface would be used for the route.  The fallback hostname lookup is
+    useful on systems without a default route (for example during boot).
+    """
+
+    for destination in (("192.0.2.1", 9), ("8.8.8.8", 53)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(destination)
+            address = sock.getsockname()[0]
+            if address and not address.startswith("127."):
+                return address
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = info[4][0]
+            if address and not address.startswith("127."):
+                return address
+    except OSError:
+        pass
+    return None
+
+
+def _private_ipv4(host: str | None) -> bool:
+    if not host:
+        return False
+    try:
+        value = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return value.version == 4 and (value.is_private or value.is_loopback or value.is_link_local)
 
 
 def _now():
@@ -205,6 +248,31 @@ class ONVIFGateway:
 
     def _xaddr(self, service: str):
         return f"{self.base_url}/onvif/{service}"
+
+    def _refresh_discovery_base(self):
+        """Refresh a stale private-IP base URL before answering discovery.
+
+        ``settings.base_url`` is retained for installations that deliberately
+        advertise a DNS name or a public/NAT address.  A persisted RFC1918 or
+        loopback address, however, commonly becomes stale after a DHCP lease
+        or board migration.  In that case use the address selected by the
+        current routing table so the first WS-Discovery response already
+        points at the reachable interface.  HTTP requests subsequently update
+        ``base_url`` from their actual request origin in ``main``.
+        """
+
+        parts = urlsplit(self.base_url)
+        if not _private_ipv4(parts.hostname):
+            return
+        current = _local_ipv4()
+        if not current or current == parts.hostname:
+            return
+        netloc = current
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        self.base_url = urlunsplit(
+            (parts.scheme or "http", netloc, parts.path, parts.query, parts.fragment)
+        ).rstrip("/")
 
     def _source_config(self, camera, tag="tt:VideoSourceConfiguration"):
         p = self._profile(camera)
@@ -667,6 +735,7 @@ class ONVIFGateway:
         ]
 
     def discovery_response(self, data: bytes) -> bytes | None:
+        self._refresh_discovery_base()
         try:
             root = ET.fromstring(data)
         except ET.ParseError:

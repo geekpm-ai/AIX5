@@ -31,6 +31,8 @@ sudo cat /var/lib/aix5-ai/initial-admin.txt
 
 已有安装升级会保留原账号，不会重置密码。Web / ONVIF 使用应用账号；SSH 使用你为开发板设置的系统账号。
 
+设备更换局域网 IP 后，服务会在启动、ONVIF 请求和系统状态请求中按当前活动网卡地址更新保存的 `base_url`。ONVIF 的 XAddr、Snapshot、PullPoint、RTSP URI、事件截图 URL 和联动页面显示地址都会使用新的公开地址，不需要手工改代码或重新添加摄像机。
+
 1. **添加摄像机**：在“设备管理”中扫描 ONVIF 设备，或填写 RTSP 地址；拖动设备前的手柄可调整预览顺序。
 2. **选择检测类别**：打开设备的“AI 显示”，选择需要检测的目标，支持分组全选和全局全选。
 3. **建立规则**：在“规则配置”点击“新增条目”，选择摄像机、触发事件、目标和阈值；区域规则可直接在画面上绘制矩形或多边形。
@@ -50,12 +52,14 @@ sudo cat /var/lib/aix5-ai/initial-admin.txt
 | 摄像机接入 | ONVIF WS-Discovery 扫描、账号验证、Profile 选择，或直接添加 RTSP；支持 H.264 / H.265 输入 |
 | 硬件处理 | RDK VPU 视频解码与 H.264 编码，BPU 运行 YOLO11n / YOLO11m；硬件初始化支持重试 |
 | 检测类别 | COCO 80 类，按摄像机启用；默认人、猫、狗 |
-| 网页预览 | WebRTC H.264 + Opus；1920×1080 / 960×540 可选，全屏使用源尺寸；同路同模式共享编码 |
+| 网页预览 | 卡片显示当前 H.264 / H.265 格式和分辨率；WebRTC + Opus，1920×1080 / 960×540 可选，全屏使用源尺寸；同路同模式共享编码 |
 | 音频 | 探测源音频编码、解码并显示输入等级；各路独立开关，默认静音 |
 | 规则 | 整幅画面或区域检测、多目标、置信度、连续命中、冷却和清除时间；新规则置顶 |
+| 目标缺失规则 | 可设置目标持续缺失 1 分钟、5 分钟、10 分钟、30 分钟或 1 小时后触发一次告警；目标重新出现后复位 |
 | 本地事件 | 事件与 JPEG 截图，3 / 7 / 30 天保留、容量覆盖、JSON / CSV 导出；不录像 |
+| 文件管理 | 系统设置显示数据目录、事件截图占用和可清理垃圾文件；清理不会触碰当前事件、账号或数据库 |
 | 系统设置 | 预览分辨率、软件回退、事件保留、时区和单用户账号修改 |
-| Home Assistant | 一台 ONVIF 网关提供多路视频和规则传感器，无需 MQTT Broker |
+| Home Assistant | 一台 ONVIF 网关提供多路视频和规则传感器 |
 
 ### 规则配置
 
@@ -89,6 +93,25 @@ sudo cat /var/lib/aix5-ai/initial-admin.txt
 | 其他依赖 | FFmpeg / FFprobe、MediaMTX Linux ARM64；浏览器支持 WebRTC |
 
 以上是参考环境，不代表所有硬件组合的性能保证。完整 BPU / VPU 功能需要在 RDK X5 上运行；普通开发机可运行控制面和自动化测试。
+
+### 项目外壳与打印文件
+
+下面两张图对应项目配套的 RDK X5 外壳：第一张是外壳与开发板的三维结构视图，第二张是打印完成后的实物照片。
+
+<p align="center">
+  <img src="img/devboard-3d.png" alt="项目设计的 RDK X5 外壳三维结构视图" width="620">
+</p>
+
+<p align="center">
+  <img src="img/devboard.jpeg" alt="项目设计外壳打印后的 RDK X5 实物照片" width="620">
+</p>
+
+仓库同时提供两种外壳文件：
+
+- [RDK-BOX.step](3D/RDK-BOX.step)：STEP CAD 交换格式，适合在 CAD 软件中查看、修改和继续设计。
+- [RDK-BOX.3mf](3D/RDK-BOX.3mf)：3MF 模型文件，适合导入切片软件准备打印。
+
+外壳按当前 RDK X5 开发板和接口布局设计。打印或修改前请根据手上的板卡版本、接口位置、散热件和安装方式核对尺寸；这些模型是硬件配套资料，不属于 AIX5 运行时依赖。
 
 官方资料：[RDK X5 文档](https://developer.d-robotics.cc/rdk_x_doc/RDK?v=3.5.0&p=RDK+X5) · [RDK 摄像机显示示例](https://developer.d-robotics.cc/rdk_x_doc/Basic_Application/pydev_demo_sample/RDK_X5/web_display_camera_sample?v=3.5.0&p=RDK+X5)
 
@@ -185,6 +208,8 @@ docs/             公开安装指南；本地诊断报告由 .gitignore 排除
 - **账号**：一个应用账号，密码使用 Argon2；用户名与密码在系统设置中修改。
 - **备份**：持久数据包括数据库、事件截图和 `.onvif-secret.key`。ONVIF 加密凭据恢复需要数据库与密钥配对。
 
+系统设置中的文件占用卡片读取 `GET /api/storage/status`。点击清理时调用 `POST /api/storage/cleanup`，只处理应用识别的临时文件和不再被事件记录引用的截图；当前事件、数据库、账号和 ONVIF 密钥不会被清理。
+
 应用面向可信局域网，默认 HTTP 与 RTSP 不提供传输层加密。运行时配置、账号、摄像机 URL、数据库和事件截图应保存在数据目录；这些内容不属于源码仓库。
 
 ## 开发与验证
@@ -213,7 +238,7 @@ python tools/verify_native_backpressure.py
 - 特定 H.264 / H.265 码流可能超出 VPU 能力；默认不会隐式转为软件视频编解码。
 - 烟火 / 烟雾模型尚未接入已验证的推理链，不能作为现成功能使用。
 - HA 可能自动生成重启、校时等按钮，当前未实现的 ONVIF 操作会返回不支持错误。
-- MQTT 仅保留旧部署兼容后端，新的界面与集成流程使用 ONVIF。
+- Home Assistant 统一通过 ONVIF 接入视频、音频和规则事件。
 
 ## 许可
 

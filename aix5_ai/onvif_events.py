@@ -1,10 +1,9 @@
 """ONVIF event state and PullPoint notification support.
 
-The application already has a rule engine and an MQTT publisher.  This module
-keeps the ONVIF side deliberately small and independent from both of those
-implementations: only formal rule episode edges are published, and every
-PullPoint subscriber receives its own bounded queue.  The HTTP/SOAP adapter is
-in :mod:`aix5_ai.main`.
+The application already has a rule engine. This module keeps the ONVIF event
+side deliberately small: only formal rule episode edges are published, and
+every PullPoint subscriber receives its own bounded queue. The HTTP/SOAP
+adapter is in :mod:`aix5_ai.main`.
 
 One configured rule is one ONVIF property. Target classes remain internal
 contributors to that property's active episode; their names are metadata.
@@ -330,7 +329,13 @@ class OnvifEventHub:
             target_labels=tuple(sorted(set(map(str, rule.get("target_labels", []))))),
             event_type=str(
                 rule.get("event_type")
-                or ("target_entered_zone" if rule.get("zone") else "target_detected")
+                or (
+                    "target_absent"
+                    if rule.get("absence_seconds")
+                    else "target_entered_zone"
+                    if rule.get("zone")
+                    else "target_detected"
+                )
             ),
             enabled=bool(rule.get("enabled", True)),
             camera_name=str(camera_name),

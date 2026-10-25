@@ -125,6 +125,7 @@ class RuleConfig(BaseModel):
     cooldown_seconds: float = Field(default=60, ge=1, le=86400)
     min_hits: int = Field(default=2, ge=1, le=10)
     clear_seconds: float = Field(default=3, ge=1, le=60)
+    absence_seconds: Literal[None, 60, 300, 600, 1800, 3600] = None
     zone: list[tuple[float, float]] = Field(default=[], max_length=32)
 
     @field_validator("zone")
@@ -166,27 +167,12 @@ class RulePatch(BaseModel):
     min_hits: int | None = None
     clear_seconds: float | None = None
     zone: list[tuple[float, float]] | None = None
+    absence_seconds: Literal[None, 60, 300, 600, 1800, 3600] | None = None
 
     @model_validator(mode="after")
     def no_null_fields(self):
-        if any(getattr(self, key) is None for key in self.model_fields_set):
+        if any(getattr(self, key) is None for key in self.model_fields_set if key != "absence_seconds"):
             raise ValueError("规则字段不能为 null")
-        return self
-
-
-class MQTTConfig(BaseModel):
-    enabled: bool = False
-    host: str = Field(default="", max_length=253)
-    port: int = Field(default=1883, ge=1, le=65535)
-    username: str = Field(default="", max_length=128)
-    password: str = Field(default="", max_length=256)
-    tls: bool = False
-
-    @model_validator(mode="after")
-    def enabled_host(self):
-        self.host = self.host.strip()
-        if self.enabled and not self.host:
-            raise ValueError("启用 MQTT 时必须填写 Broker 地址")
         return self
 
 
@@ -197,7 +183,6 @@ class SettingsConfig(BaseModel):
     retention_days: Literal[3, 7, 30] = 7
     max_event_storage_mb: int = Field(default=2048, ge=16, le=8192)
     base_url: str = Field(max_length=255)
-    mqtt: MQTTConfig
 
     @field_validator("timezone")
     @classmethod
@@ -230,7 +215,6 @@ class SettingsPatch(BaseModel):
     retention_days: Literal[3, 7, 30] | None = None
     max_event_storage_mb: int | None = Field(default=None, ge=16, le=8192)
     base_url: str | None = Field(default=None, max_length=255)
-    mqtt: MQTTConfig | None = None
 
     @model_validator(mode="after")
     def no_null_fields(self):

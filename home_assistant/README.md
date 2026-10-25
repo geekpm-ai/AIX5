@@ -1,6 +1,6 @@
 # Edge AI ONVIF 规则同步
 
-这个自定义集成补充 Home Assistant 原生 ONVIF 集成的规则名称与删除同步。视频、音频、传感器创建和告警状态仍由原生 ONVIF 处理；无需 MQTT、HA API Token 或重复填写设备密码。
+这个自定义集成补充 Home Assistant 原生 ONVIF 集成的规则名称与删除同步。视频、音频、传感器创建和告警状态仍由原生 ONVIF 处理；不需要 HA API Token 或重复填写设备密码。
 
 它通过 ONVIF Media `GetVideoAnalyticsConfigurations` 和 Analytics `GetRules` 读取完整规则目录，复用所选原生 ONVIF 配置条目的设备账号。每条界面规则对应一个传感器，规则内不同目标类别由 AIX5 聚合。传感器显示名与 AIX5 中的规则名称一致，改名保持原实体 ID，已有自动化仍引用同一个实体。
 

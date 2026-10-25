@@ -68,3 +68,37 @@ def test_disabled_rules_discard_active_state():
 def test_zone_requires_image_dimensions():
     with pytest.raises(ValueError):
         RuleEngine().evaluate("c", [detection()], [rule()], 1)
+
+
+def test_absence_rule_emits_after_continuous_gap_and_resets_on_return():
+    engine = RuleEngine()
+    configured = [rule(min_hits=1, zone=[], absence_seconds=60)]
+    # First no-target frame starts the absence clock; threshold is not reached.
+    assert not engine.evaluate("c", [], configured, 100)[0]
+    assert not engine.evaluate("c", [], configured, 159)[0]
+    events, present = engine.evaluate("c", [], configured, 160)
+    assert len(events) == 1
+    assert events[0]["event_type"] == "target_absent"
+    assert events[0]["confidence"] == 0.0
+    assert not present["person"]
+    assert not engine.evaluate("c", [], configured, 200)[0]
+    # A target returning clears the absence episode, without a false presence
+    # alert or a target-present event.
+    events, present = engine.evaluate("c", [detection()], configured, 201)
+    assert not events and present["person"]
+    assert not engine.evaluate("c", [], configured, 202)[0]
+    assert len(engine.evaluate("c", [], configured, 262)[0]) == 1
+
+
+def test_absence_rule_respects_normalized_zone_and_cooldown():
+    engine = RuleEngine()
+    configured = [rule(min_hits=1, zone=[(0, 0), (0.5, 0), (0.5, 1), (0, 1)], absence_seconds=60)]
+    # A target outside the zone still counts as absent.
+    events, _ = engine.evaluate("c", [detection((70, 0, 90, 80))], configured, 10, (100, 100))
+    assert not events
+    events, _ = engine.evaluate("c", [], configured, 70, (100, 100))
+    assert len(events) == 1 and events[0]["event_type"] == "target_absent"
+    engine.evaluate("c", [detection((10, 0, 20, 80))], configured, 71, (100, 100))
+    engine.evaluate("c", [], configured, 131, (100, 100))
+    # Cooldown is 60 seconds and the new absence episode started at 71.
+    assert not engine.evaluate("c", [], configured, 180, (100, 100))[0]

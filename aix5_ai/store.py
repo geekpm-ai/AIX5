@@ -57,6 +57,11 @@ class Store:
             self.set("settings", DEFAULT_SETTINGS)
             self.set("ha_token", secrets.token_urlsafe(32))
         settings = self.get("settings", {})
+        # Keep only settings understood by the current application.
+        cleaned_settings = {key: value for key, value in settings.items() if key in DEFAULT_SETTINGS}
+        if cleaned_settings != settings:
+            settings = cleaned_settings
+            self.set("settings", settings)
         if (
             "preview_resolution" not in settings
             or "allow_software_fallback" not in settings
@@ -398,3 +403,74 @@ class Store:
             return False
         self.db.execute("DELETE FROM detections WHERE id=?", (row["id"],))
         return True
+
+    def _storage_snapshot(self):
+        """Return storage accounting and candidates safe for cleanup."""
+        data_root = self.root.resolve()
+        events_root = (self.root / "events").resolve()
+        referenced = set()
+        for row in self.db.execute("SELECT payload FROM detections"):
+            try:
+                path = Path(json.loads(row["payload"]).get("image_path", "")).resolve()
+                if path.is_relative_to(events_root):
+                    referenced.add(path)
+            except (OSError, TypeError, ValueError):
+                continue
+        data_bytes = events_bytes = events_files = 0
+        candidates = {}
+        image_suffixes = {".jpg", ".jpeg", ".png", ".webp"}
+        temporary_prefixes = (".event-", ".tmp-")
+        temporary_suffixes = {".tmp", ".part", ".next"}
+        for path in data_root.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            try:
+                size = path.stat().st_size
+                data_bytes += size
+                in_events = path.is_relative_to(events_root)
+                if in_events:
+                    events_files += 1
+                    events_bytes += size
+                    if path.resolve() not in referenced and path.suffix.lower() in image_suffixes:
+                        candidates[str(path)] = (path, size, "orphan_event_image")
+                if path.name.startswith(temporary_prefixes) or path.suffix in temporary_suffixes:
+                    candidates[str(path)] = (path, size, "temporary_file")
+            except OSError:
+                continue
+        values = list(candidates.values())
+        return {
+            "data_dir": str(data_root),
+            "events_dir": str(events_root),
+            "data_bytes": data_bytes,
+            "events_bytes": events_bytes,
+            "events_files": events_files,
+            "event_records": self.db.execute("SELECT COUNT(*) FROM detections").fetchone()[0],
+            "garbage_files": len(values),
+            "garbage_bytes": sum(item[1] for item in values),
+            "garbage": [
+                {"path": str(item[0].relative_to(data_root)), "bytes": item[1], "kind": item[2]}
+                for item in values
+            ],
+        }
+
+    @synchronized
+    def storage_status(self):
+        return self._storage_snapshot()
+
+    @synchronized
+    def cleanup_storage(self):
+        snapshot = self._storage_snapshot()
+        deleted = []
+        for item in snapshot["garbage"]:
+            path = (self.root / item["path"]).resolve()
+            try:
+                if path.is_file() and not path.is_symlink() and path.is_relative_to(self.root.resolve()):
+                    path.unlink()
+                    deleted.append(item)
+            except OSError:
+                continue
+        return {
+            "deleted_files": len(deleted),
+            "deleted_bytes": sum(item["bytes"] for item in deleted),
+            "items": deleted,
+        }

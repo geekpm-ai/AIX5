@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, datetime, logging, os, time, uuid, csv, io, json, re
+import ipaddress
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -29,10 +30,14 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 from .labels import COCO_GROUPS, COCO_LABELS, COCO_LABELS_ZH, DEFAULT_ENABLED_LABELS
 from .metrics import metrics
-from .mqtt import publisher
 from .onvif import discover, probe
 from .onvif_auth import authenticate as authenticate_onvif, OnvifAuthError
-from .onvif_gateway import gateway as onvif_gateway, _action_name, _fault
+from .onvif_gateway import (
+    gateway as onvif_gateway,
+    _action_name,
+    _fault,
+    _local_ipv4,
+)
 from .onvif_events import OnvifEventHub
 from .rtsp_output import RtspOutputManager
 from .rules import RuleEngine
@@ -191,24 +196,9 @@ def camera_state(camera):
         # A disconnected/disabled source must not leave a stale ONVIF binary
         # sensor in the ``true`` state.
         onvif_events.clear_camera(cid)
-    if store:
-        present = camera.get("present", {})
-        publisher.publish_state(
-            store.get("device_id"),
-            cid,
-            {
-                "online": camera.get("status") == "running",
-                "person": present.get("person", False),
-                "pet": present.get("pet", False),
-            },
-        )
-
-
 def refresh_discovery():
     settings = store.get("settings")
-    publisher.publish_discovery(
-        list(manager.cameras.values()), store.get("device_id"), settings["base_url"]
-    )
+    settings = _reconcile_saved_base_url(settings)
     # Keep ONVIF profile enumeration in sync when the manager dictionary is
     # replaced by a reorder operation or changed by add/delete operations.
     configure_onvif_gateway(settings["base_url"])
@@ -229,26 +219,81 @@ def configure_onvif_gateway(base_url=None):
     )
 
 
+def _reconcile_saved_base_url(settings=None):
+    """Replace a stale private IPv4 address after a DHCP/interface change.
+
+    A configured DNS name or public/NAT address is intentional and remains
+    untouched.  Only private, loopback, or link-local numeric addresses are
+    reconciled with the active LAN interface selected by the kernel.
+    """
+
+    settings = dict(settings or store.get("settings", {}))
+    configured = str(settings.get("base_url") or "").rstrip("/")
+    try:
+        parts = urlsplit(configured)
+        address = ipaddress.ip_address(parts.hostname or "")
+    except ValueError:
+        return settings
+    if address.version != 4 or not (
+        address.is_private or address.is_loopback or address.is_link_local
+    ):
+        return settings
+    current = _local_ipv4()
+    if not current or current == parts.hostname:
+        return settings
+    netloc = current + (f":{parts.port}" if parts.port else "")
+    updated = urlunsplit(
+        (parts.scheme or "http", netloc, parts.path, parts.query, parts.fragment)
+    ).rstrip("/")
+    settings["base_url"] = updated
+    store.set("settings", settings)
+    return settings
+
+
+def _request_public_base(request: Request):
+    """Return the origin the current client actually used.
+
+    Direct LAN requests are authoritative for the advertised ONVIF XAddr and
+    RTSP host.  Test clients and loopback health checks fall back to the saved
+    public origin so local control-plane tests do not rewrite production data.
+    """
+
+    candidate = str(request.base_url).rstrip("/")
+    host = urlsplit(candidate).hostname or ""
+    if host in {"test", "testserver", "localhost", "127.0.0.1", "::1"}:
+        return _reconcile_saved_base_url().get("base_url") or candidate
+    try:
+        candidate_ip = ipaddress.ip_address(host)
+    except ValueError:
+        candidate_ip = None
+    if candidate_ip is not None and (
+        candidate_ip.is_private or candidate_ip.is_loopback or candidate_ip.is_link_local
+    ):
+        current = _local_ipv4()
+        if current and host != current:
+            return _reconcile_saved_base_url().get("base_url") or candidate
+    return candidate
+
+
+def _sync_request_public_base(request: Request):
+    settings = _reconcile_saved_base_url()
+    candidate = _request_public_base(request)
+    if candidate != settings.get("base_url"):
+        settings["base_url"] = candidate
+        store.set("settings", settings)
+        configure_onvif_gateway(candidate)
+    return candidate
+
+
 async def refresh_rtsp_credentials():
     if rtsp_output is not None:
         password = await run_worker(store.onvif_password)
         await rtsp_output.configure(store.get("username"), password)
 
 
-async def mqtt_loop():
-    while True:
-        for cid, camera in list(manager.cameras.items()):
-            camera_state(camera)
-            image = manager.frames.get(cid)
-            if image and publisher.cfg.get("enabled"):
-                publisher.snapshot(cid, image)
-        await asyncio.sleep(1)
-
-
 async def inference_loop(cid):
     camera = manager.cameras[cid]
     queue = manager.frame_queues[cid]
-    device_id = store.get("device_id")
     last_infer = -1e20
     while True:
         bgr, jpg, generation = await queue.get()
@@ -352,7 +397,7 @@ async def inference_loop(cid):
                 raise RuntimeError("事件截图编码失败")
             if generation != manager.generations.get(cid):
                 continue
-            settings = store.get("settings")
+            settings = _reconcile_saved_base_url(store.get("settings"))
             base = settings.get("base_url", "").rstrip("/")
 
             def rule_event_is_current(event):
@@ -397,7 +442,6 @@ async def inference_loop(cid):
                 # old-condition trigger into the newly configured rule sensor.
                 if rule_event_is_current(event):
                     onvif_events.publish_trigger(cid, {**event, "event_id": eid})
-                publisher.event(device_id, camera, payload, base)
             # One sensor aggregates a rule's targets. Publish newly triggered
             # targets first so a same-frame target handoff cannot pulse false.
             onvif_events.sync_active(cid, engine.active_rules(cid))
@@ -426,13 +470,10 @@ async def startup():
     store = await run_worker(Store)
     rtsp_output = RtspOutputManager(manager, store.root)
     manager.status_listener = camera_state
-    settings = store.get("settings")
+    settings = _reconcile_saved_base_url(store.get("settings"))
     manager.preview_resolution = settings.get("preview_resolution", "960x540")
     manager.allow_software_fallback = settings.get("allow_software_fallback", False)
     codec_tuning.allow_software_fallback = manager.allow_software_fallback
-    await run_worker(
-        publisher.configure, settings.get("mqtt", {}), store.get("device_id")
-    )
     for camera in store.cameras():
         # Validate persisted config and discard legacy runtime fields.
         config = CameraConfig.model_validate(camera).model_dump()
@@ -447,13 +488,12 @@ async def startup():
     await rtsp_output.start()
     await onvif_gateway.start_discovery()
     tasks["_retention"] = asyncio.create_task(retention_loop())
-    tasks["_mqtt"] = asyncio.create_task(mqtt_loop())
 
 
 async def retention_loop():
     while True:
         try:
-            settings = store.get("settings")
+            settings = _reconcile_saved_base_url(store.get("settings"))
             await run_worker(
                 store.purge,
                 settings.get("retention_days", 7),
@@ -483,7 +523,6 @@ async def shutdown():
     await onvif_gateway.stop()
     manager.status_listener = None
     await close_peers()
-    await run_worker(publisher.close)
     if store:
         store.close()
         store = None
@@ -594,7 +633,7 @@ async def logout(
 
 
 @app.get("/api/system/status")
-async def status(_: bool = Depends(auth)):
+async def status(request: Request, _: bool = Depends(auth)):
     system = metrics.snapshot()
     system["webrtc_viewers"] = len(peer_connections)
     system["webrtc_codec"] = "H264 on demand"
@@ -603,7 +642,7 @@ async def status(_: bool = Depends(auth)):
     return {
         "system": system,
         "cameras": [camera_view(c) for c in manager.cameras.values()],
-        "storage": public_settings(),
+        "storage": public_settings(request),
     }
 
 
@@ -731,7 +770,8 @@ async def delete_camera(cid: str, _: bool = Depends(auth)):
 
 
 @app.post("/api/onvif/discover")
-async def onvif(_: bool = Depends(auth)):
+async def onvif(request: Request, _: bool = Depends(auth)):
+    _sync_request_public_base(request)
     devices = await discover()
     # The gateway also answers WS-Discovery for Home Assistant. Keep it out of
     # its own camera picker so users do not accidentally add AIX5 as a source.
@@ -756,11 +796,7 @@ async def onvif_event_status(_: bool = Depends(auth)):
 
 
 async def _onvif_base(request: Request):
-    settings = store.get("settings", {}) if store else {}
-    configured = (settings.get("base_url") or "").rstrip("/")
-    # A configured base URL is stable for HA. The request host remains a useful
-    # fallback for installations that left the setting blank.
-    return configured or str(request.base_url).rstrip("/")
+    return _sync_request_public_base(request)
 
 
 async def _onvif_basic_auth(request: Request, body: str = ""):
@@ -791,9 +827,9 @@ async def onvif_service(service: str, request: Request):
         except HTTPException as exc:
             return Response(_fault(exc.detail, "NotAuthorized"), status_code=401,
                             media_type="application/soap+xml", headers=exc.headers)
-    configure_onvif_gateway(await _onvif_base(request))
+    request_base = await _onvif_base(request)
     return Response(
-        await onvif_gateway.handle(service, body, await _onvif_base(request)),
+        await onvif_gateway.handle(service, body, request_base),
         media_type="application/soap+xml",
     )
 
@@ -806,6 +842,7 @@ async def onvif_subscription(token: str, request: Request):
     except HTTPException as exc:
         return Response(_fault(exc.detail, "NotAuthorized"), status_code=401,
                         media_type="application/soap+xml", headers=exc.headers)
+    await _onvif_base(request)
     envelope_body = re.search(
         r"<(?:[\w.-]+:)?Body\b[^>]*>(.*?)</(?:[\w.-]+:)?Body>",
         body,
@@ -992,6 +1029,7 @@ async def remove_rule(rid: str, _: bool = Depends(auth)):
 
 @app.get("/api/events")
 async def events(
+    request: Request,
     camera_id: str | None = None,
     event_type: str | None = None,
     target_type: str | None = None,
@@ -999,11 +1037,12 @@ async def events(
     _: bool = Depends(auth),
 ):
     rows = store.events(camera_id, max(1, min(limit, 500)), event_type, target_type)
-    return rows
+    return _public_event_rows(rows, request)
 
 
 @app.get("/api/events/export")
 async def export_events(
+    request: Request,
     format: str = "json",
     camera_id: str | None = None,
     event_type: str | None = None,
@@ -1011,6 +1050,7 @@ async def export_events(
     _: bool = Depends(auth),
 ):
     rows = store.events(camera_id, 5000, event_type, target_type)
+    rows = _public_event_rows(rows, request)
     if format.lower() == "csv":
         out = io.StringIO()
         fields = [
@@ -1057,16 +1097,46 @@ async def event_image(
     )
 
 
-def public_settings():
+@app.get("/api/storage/status")
+async def storage_status(_: bool = Depends(auth)):
+    return await run_worker(store.storage_status)
+
+
+@app.post("/api/storage/cleanup")
+async def storage_cleanup(_: bool = Depends(auth)):
+    return await run_worker(store.cleanup_storage)
+
+
+def public_settings(request: Request | None = None):
+    if request is not None:
+        _sync_request_public_base(request)
     settings = {**DEFAULT_SETTINGS, **store.get("settings", {})}
-    settings["mqtt"] = {**DEFAULT_SETTINGS["mqtt"], **settings.get("mqtt", {})}
-    settings["mqtt"]["password"] = ""
     return settings
 
 
+def _public_event_rows(rows, request: Request):
+    """Rebuild screenshot origins from the current public address.
+
+    Older event payloads may contain an origin captured before a DHCP change.
+    Keep their stored payload untouched while returning a usable URL to the
+    current client.
+    """
+
+    base = _sync_request_public_base(request)
+    result = []
+    for row in rows:
+        item = dict(row)
+        if item.get("id"):
+            item["screenshot_url"] = (
+                f"{base}/api/events/{item['id']}/image?token={store.get('ha_token')}"
+            )
+        result.append(item)
+    return result
+
+
 @app.get("/api/settings")
-async def settings(_: bool = Depends(auth)):
-    return public_settings()
+async def settings(request: Request, _: bool = Depends(auth)):
+    return public_settings(request)
 
 
 @app.patch("/api/settings")
@@ -1074,13 +1144,11 @@ async def patch_settings(req: SettingsPatch, _: bool = Depends(auth)):
     async with settings_lock:
         old = store.get("settings")
         updates = req.model_dump(exclude_unset=True)
-        if "mqtt" in updates:
-            updates["mqtt"] = {**old["mqtt"], **req.mqtt.model_dump(exclude_unset=True)}
         try:
             s = SettingsConfig.model_validate({**old, **updates}).model_dump()
         except ValidationError as exc:
             raise HTTPException(422, exc.errors(include_context=False))
-        s["mqtt"]["password"] = s["mqtt"]["password"] or old["mqtt"].get("password", "")
+        s = _reconcile_saved_base_url(s)
         store.set("settings", s)
         manager.preview_resolution = s["preview_resolution"]
         manager.allow_software_fallback = s["allow_software_fallback"]
@@ -1096,28 +1164,7 @@ async def patch_settings(req: SettingsPatch, _: bool = Depends(auth)):
         if old.get("preview_resolution", "960x540") != s["preview_resolution"]:
             manager.frames.clear()
             manager.preview_next.clear()
-        device_id = store.get("device_id")
-        if old["mqtt"] != s["mqtt"]:
-            await run_worker(publisher.configure, s["mqtt"], device_id)
-        if s["mqtt"].get("enabled") and (
-            old["mqtt"] != s["mqtt"] or old["base_url"] != s["base_url"]
-        ):
-            publisher.publish_discovery(
-                list(manager.cameras.values()), device_id, s["base_url"]
-            )
         return {"ok": True}
-
-
-@app.post("/api/settings/mqtt/test")
-async def test_mqtt(_: bool = Depends(auth)):
-    async with settings_lock:
-        cfg = store.get("settings").get("mqtt", {})
-        if not cfg.get("enabled"):
-            return {"ok": False, "message": "MQTT 尚未启用"}
-        ok = await run_worker(publisher.configure, cfg, store.get("device_id"))
-        if not ok:
-            return {"ok": False, "message": "MQTT 客户端不可用或配置无效"}
-        return await run_worker(publisher.connection_status)
 
 
 @app.get("/api/settings/export")
@@ -1137,7 +1184,6 @@ async def export_settings(_: bool = Depends(auth)):
         "rules": store.rules(),
         "settings": store.get("settings"),
     }
-    payload["settings"]["mqtt"]["password"] = ""
     return Response(
         json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
         media_type="application/json",

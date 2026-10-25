@@ -28,6 +28,7 @@ class State:
     active: bool = False
     seen: float = 0
     emitted: float = -1e20
+    absence_since: float | None = None
 
 
 class RuleEngine:
@@ -85,6 +86,16 @@ class RuleEngine:
                     )
                 ]
                 if matches:
+                    if rule.get("absence_seconds"):
+                        # A returning target clears an absence alert episode;
+                        # absence rules do not emit target-present events.
+                        s.active = False
+                        # Keep the last-seen timestamp so the next missing
+                        # frame measures absence from the actual return frame.
+                        s.absence_since = now
+                        s.hits = 0
+                        present[label] = True
+                        continue
                     s.hits += 1
                     s.seen = now
                     if s.hits >= rule["min_hits"]:
@@ -108,6 +119,30 @@ class RuleEngine:
                                 }
                             )
                 else:
+                    if rule.get("absence_seconds"):
+                        s.hits = 0
+                        if s.absence_since is None:
+                            s.absence_since = now
+                        if (
+                            not s.active
+                            and now - s.absence_since >= rule["absence_seconds"]
+                            and now - s.emitted >= rule["cooldown_seconds"]
+                        ):
+                            s.active = True
+                            s.emitted = now
+                            events.append(
+                                {
+                                    "rule_id": rule["id"],
+                                    "rule_name": rule["name"],
+                                    "event_type": "target_absent",
+                                    "target_type": label,
+                                    "confidence": 0.0,
+                                    "bbox": [0.0, 0.0, 0.0, 0.0],
+                                }
+                            )
+                        # An absence alert is the ONVIF active episode; it does
+                        # not make the ordinary detection presence indicator true.
+                        continue
                     s.hits = 0
                     if now - s.seen >= rule["clear_seconds"]:
                         s.active = False

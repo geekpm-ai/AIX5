@@ -10,7 +10,6 @@ import pytest
 
 from aix5_ai import main, webrtc
 from aix5_ai.hw_capture import HardwareManager, HardwareCapture
-from aix5_ai.mqtt import Publisher
 from aix5_ai.rules import RuleEngine
 from aix5_ai.store import Store
 
@@ -18,17 +17,19 @@ from aix5_ai.store import Store
 @pytest.fixture
 async def client(tmp_path, monkeypatch):
     # API unit tests may run on the live board: never bind its discovery/RTSP
-    # ports or start publishers with temporary credentials.
+    # ports or start external services.
     monkeypatch.setattr(main.onvif_gateway, "start_discovery", AsyncMock())
     monkeypatch.setattr(main.RtspOutputManager, "start", AsyncMock())
     monkeypatch.setattr(main, "hbm_runtime", None)
     monkeypatch.setattr(main, "inference_executor", None)
+    # Keep API tests independent of whichever LAN interface is active on the
+    # workstation. Individual address-reconciliation tests override this.
+    monkeypatch.setattr(main, "_local_ipv4", lambda: None)
     monkeypatch.setattr(main, "Store", lambda: Store(tmp_path / "app.db"))
     manager = HardwareManager()
     monkeypatch.setattr(main, "manager", manager)
     monkeypatch.setattr(webrtc, "manager", manager)
     monkeypatch.setattr(main, "engine", RuleEngine())
-    monkeypatch.setattr(main, "publisher", Publisher())
     monkeypatch.setattr(main, "tasks", {})
     monkeypatch.setattr(main, "inference_sem", asyncio.Semaphore(1))
     monkeypatch.setattr(main, "camera_lock", asyncio.Lock())
@@ -131,6 +132,112 @@ async def test_onvif_services_use_account_and_subscription_action(client):
     assert replayed.status_code == 401
 
 
+async def test_onvif_public_addresses_follow_request_host_after_address_change(client):
+    """Advertised ONVIF/RTSP endpoints must use the address clients reached.
+
+    ``base_url`` can outlive a DHCP lease (for example, after moving the board
+    after an address lease change).  A Home Assistant client then reaches the service using
+    the new Host header; every XAddr, PullPoint reference and RTSP URI must be
+    rebuilt from that request rather than exposing the stale saved address.
+    """
+
+    await login(client)
+    saved = main.store.get("settings")
+    saved["base_url"] = "http://198.51.100.141:8080"
+    main.store.set("settings", saved)
+    camera = await client.post(
+        "/api/cameras",
+        json={
+            "name": "地址变化测试",
+            "rtsp_url": "rtsp://camera.example/live",
+            "enabled": True,
+        },
+    )
+    assert camera.status_code == 200
+    cid = camera.json()["id"]
+    await asyncio.sleep(0)
+    credentials = base64.b64encode(
+        f"admin:{client.initial_password}".encode()
+    ).decode()
+    auth_headers = {"Authorization": f"Basic {credentials}"}
+    envelope = (
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+        "<s:Body><td:GetCapabilities "
+        'xmlns:td="http://www.onvif.org/ver10/device/wsdl"/>'
+        "</s:Body></s:Envelope>"
+    )
+    # Supplying an absolute URL makes ASGITransport expose the new DHCP host
+    # through Request.base_url, while the saved setting intentionally remains
+    # stale.
+    capabilities = await client.post(
+        "http://198.51.100.6:8080/onvif/device_service",
+        content=envelope,
+        headers=auth_headers,
+    )
+    assert capabilities.status_code == 200
+    assert "http://198.51.100.6:8080/onvif/" in capabilities.text
+    assert "198.51.100.141" not in capabilities.text
+
+    subscribe = (
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+        '<s:Body><tev:CreatePullPointSubscription '
+        'xmlns:tev="http://www.onvif.org/ver10/events/wsdl">'
+        "</tev:CreatePullPointSubscription></s:Body></s:Envelope>"
+    )
+    subscription = await client.post(
+        "http://198.51.100.6:8080/onvif/events_service",
+        content=subscribe,
+        headers=auth_headers,
+    )
+    assert subscription.status_code == 200
+    assert "http://198.51.100.6:8080/onvif/events/subscriptions/" in subscription.text
+    assert "198.51.100.141" not in subscription.text
+    public = await client.get("/api/settings")
+    assert public.status_code == 200
+    assert public.json()["base_url"] == "http://198.51.100.6:8080"
+    events = await client.get("/api/events")
+    assert events.status_code == 200
+    assert all(
+        "198.51.100.141" not in str(item.get("screenshot_url", ""))
+        and "198.51.100.6:8080" in str(item.get("screenshot_url", ""))
+        for item in events.json()
+    )
+
+    stream = (
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+        '<s:Body><tr:GetStreamUri '
+        'xmlns:tr="http://www.onvif.org/ver10/media/wsdl">'
+        f'<tr:ProfileToken>aix5-profile-{cid}</tr:ProfileToken>'
+        "</tr:GetStreamUri></s:Body></s:Envelope>"
+    )
+    stream_response = await client.post(
+        "http://198.51.100.6:8080/onvif/media_service",
+        content=stream,
+        headers=auth_headers,
+    )
+    assert stream_response.status_code == 200
+    assert f"rtsp://198.51.100.6:8554/aix5/{cid}" in stream_response.text
+    assert "198.51.100.141" not in stream_response.text
+
+
+async def test_saved_private_base_url_reconciles_to_active_interface(client, monkeypatch):
+    await login(client)
+    settings = main.store.get("settings")
+    settings["base_url"] = "http://198.51.100.141:8080"
+    main.store.set("settings", settings)
+    monkeypatch.setattr(main, "_local_ipv4", lambda: "198.51.100.6")
+
+    updated = main._reconcile_saved_base_url()
+    assert updated["base_url"] == "http://198.51.100.6:8080"
+    assert main.store.get("settings")["base_url"] == "http://198.51.100.6:8080"
+
+    # A DNS/public origin is an intentional deployment choice and must not be
+    # replaced by whichever interface happens to be active locally.
+    settings["base_url"] = "https://edge.example.invalid:8443"
+    main.store.set("settings", settings)
+    assert main._reconcile_saved_base_url()["base_url"] == settings["base_url"]
+
+
 async def test_camera_patch_enable_disable_and_config_export(client):
     await login(client)
     response = await client.post(
@@ -196,15 +303,6 @@ async def test_partial_patch_validates_merged_config(client):
     result = await client.patch("/api/cameras/" + cid, json={"name": "renamed"})
     assert result.status_code == 200
     assert result.json()["rtsp_url"] == "rtsp://localhost"
-
-
-async def test_system_status_never_returns_mqtt_password(client):
-    await login(client)
-    settings = main.store.get("settings")
-    settings["mqtt"]["password"] = "private-broker-password"
-    main.store.set("settings", settings)
-    for url in ["/api/settings", "/api/system/status", "/api/settings/export"]:
-        assert "private-broker-password" not in (await client.get(url)).text
 
 
 async def test_inference_retries_and_observes_camera_model_change(client, monkeypatch):
@@ -316,6 +414,23 @@ async def test_rule_event_uses_inference_frame_without_waiting_for_preview_cache
     assert camera["present"]["person"]
 
 
+async def test_storage_status_and_cleanup_only_remove_orphans(client):
+    await login(client)
+    events_dir = main.store.root / "events"
+    events_dir.mkdir(exist_ok=True)
+    orphan = events_dir / "orphan.jpg"
+    temporary = main.store.root / ".event-crash"
+    orphan.write_bytes(b"orphan")
+    temporary.write_bytes(b"temporary")
+    status = await client.get("/api/storage/status")
+    assert status.status_code == 200
+    assert status.json()["garbage_files"] >= 2
+    cleaned = await client.post("/api/storage/cleanup")
+    assert cleaned.status_code == 200
+    assert cleaned.json()["deleted_files"] >= 2
+    assert not orphan.exists() and not temporary.exists()
+
+
 async def test_rule_sensor_lifecycle_and_name_only_change_preserve_active_state(client):
     await login(client)
     camera = await client.post(
@@ -416,7 +531,6 @@ async def test_rule_condition_edit_during_event_persistence_cannot_publish_old_t
             ]}
 
     entered, release = threading.Event(), threading.Event()
-    finished = asyncio.Event()
     original_insert = main.store.insert_event
 
     def persist(event, image):
@@ -427,7 +541,6 @@ async def test_rule_condition_edit_during_event_persistence_cannot_publish_old_t
     monkeypatch.setattr(main, "get_detector", lambda _: Detector())
     monkeypatch.setattr(main, "make_web_preview", lambda _: b"frame")
     monkeypatch.setattr(main.store, "insert_event", persist)
-    monkeypatch.setattr(main.publisher, "event", lambda *args: finished.set())
     main.manager.frame_queues[cid].put_nowait(
         (np.zeros((16, 16, 3), np.uint8), None, main.manager.generations[cid])
     )
@@ -439,7 +552,7 @@ async def test_rule_condition_edit_during_event_persistence_cannot_publish_old_t
         )
         assert response.status_code == 200
         release.set()
-        await asyncio.wait_for(finished.wait(), 2)
+        await asyncio.sleep(0.1)
         notifications = await main.onvif_events.pull(sid, timeout=0)
         assert not any(item.inside for item in notifications)
         assert not main.onvif_events.snapshot()["active"]
@@ -518,7 +631,6 @@ async def test_camera_order_requires_authentication(client):
 
 async def test_system_preferences_merge_and_survive_other_settings_updates(client):
     await login(client)
-    original = (await client.get("/api/settings")).json()
     response = await client.patch(
         "/api/settings", json={"preview_resolution": "1920x1080", "retention_days": 30}
     )
@@ -526,15 +638,11 @@ async def test_system_preferences_merge_and_survive_other_settings_updates(clien
     assert main.manager.preview_resolution == "1920x1080"
     stored = main.store.get("settings")
     assert stored["retention_days"] == 30
-    assert stored["mqtt"] == original["mqtt"]
-    assert stored["max_event_storage_mb"] == original["max_event_storage_mb"]
+    assert stored["max_event_storage_mb"] == 2048
     assert (
         await client.patch(
             "/api/settings",
-            json={
-                "base_url": "http://device:8080",
-                "mqtt": {"enabled": False, "host": "broker"},
-            },
+            json={"base_url": "http://device:8080"},
         )
     ).status_code == 200
     settings = (await client.get("/api/settings")).json()
@@ -699,7 +807,7 @@ async def test_global_rules_newest_first_and_partial_rename_preserves_legacy_con
     newer = (await client.post(f"/api/cameras/{cid}/rules", json={"name": "新规则", "target_labels": ["person"], "confidence_threshold": 0.6})).json()
     rename = await client.patch("/api/rules/legacy-rule", json={"name": "只改名称"})
     assert rename.status_code == 200, rename.text
-    assert rename.json() == {**legacy, "name": "只改名称"}
+    assert rename.json() == {**legacy, "name": "只改名称", "absence_seconds": None}
     listing = (await client.get("/api/rules")).json()
     assert [r["id"] for r in listing] == [newer["id"], "legacy-rule"]
     assert all(r["camera_name"] == "客厅" for r in listing)

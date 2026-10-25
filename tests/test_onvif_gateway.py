@@ -182,6 +182,95 @@ async def test_gateway_device_capabilities_are_well_formed():
 
 
 @pytest.mark.asyncio
+async def test_gateway_reconfigure_refreshes_all_advertised_http_addresses():
+    """Changing the public base URL must invalidate every stale ONVIF URI.
+
+    The board can receive a new DHCP address while its stored camera/rule
+    configuration remains intact.  ONVIF clients cache the XAddr and PullPoint
+    subscription reference, so this checks the complete response surface after
+    reconfiguration rather than only the device service.
+    """
+
+    gateway = ONVIFGateway()
+    hub = OnvifEventHub()
+    cid = "camera-address"
+    camera = {
+        "id": cid,
+        "name": "客厅",
+        "enabled": True,
+        "width": 1920,
+        "height": 1080,
+        "source_fps": 20,
+    }
+    gateway.configure(
+        {cid: camera},
+        lambda camera_id=None: [
+            {
+                "id": "rule-address",
+                "name": "有人进入",
+                "enabled": True,
+                "target_labels": ["person"],
+            }
+        ]
+        if camera_id == cid
+        else [],
+        "http://198.51.100.141:8080",
+        event_hub=hub,
+        stream_uri=lambda item: "rtsp://198.51.100.141:8554/aix5/camera-address",
+    )
+
+    old_capabilities = await gateway.handle(
+        "device_service", request("GetCapabilities")
+    )
+    assert "http://198.51.100.141:8080/onvif/" in old_capabilities
+    old_subscription = await gateway.handle(
+        "events_service", request("CreatePullPointSubscription")
+    )
+    assert "http://198.51.100.141:8080/onvif/events/subscriptions/" in old_subscription
+
+    # Reconfigure with the address assigned by DHCP.  The stream callback is
+    # rebuilt by the application together with the gateway configuration.
+    gateway.configure(
+        {cid: camera},
+        gateway.rules,
+        "http://198.51.100.6:8080",
+        event_hub=hub,
+        stream_uri=lambda item: "rtsp://198.51.100.6:8554/aix5/camera-address",
+    )
+    new_capabilities = await gateway.handle(
+        "device_service", request("GetCapabilities")
+    )
+    assert "http://198.51.100.6:8080/onvif/" in new_capabilities
+    assert "198.51.100.141" not in new_capabilities
+    new_subscription = await gateway.handle(
+        "events_service", request("CreatePullPointSubscription")
+    )
+    assert "http://198.51.100.6:8080/onvif/events/subscriptions/" in new_subscription
+    assert "198.51.100.141" not in new_subscription
+
+    stream = await gateway.handle(
+        "media_service",
+        request(
+            "GetStreamUri",
+            '<tr:ProfileToken xmlns:tr="http://www.onvif.org/ver10/media/wsdl">'
+            f"aix5-profile-{cid}</tr:ProfileToken>",
+        ),
+    )
+    assert "rtsp://198.51.100.6:8554/aix5/camera-address" in stream
+    assert "198.51.100.141" not in stream
+    snapshot = await gateway.handle(
+        "media_service",
+        request(
+            "GetSnapshotUri",
+            '<tr:ProfileToken xmlns:tr="http://www.onvif.org/ver10/media/wsdl">'
+            f"aix5-profile-{cid}</tr:ProfileToken>",
+        ),
+    )
+    assert "http://198.51.100.6:8080/onvif/snapshots/camera-address.jpg" in snapshot
+    assert "198.51.100.141" not in snapshot
+
+
+@pytest.mark.asyncio
 async def test_gateway_uses_distinct_edge_identity():
     gateway = ONVIFGateway()
     gateway.configure({}, lambda camera_id=None: [], "http://aix5.local:8080")
@@ -426,6 +515,29 @@ def test_discovery_has_valid_stable_identity_qnames_and_correlation():
         == "http://www.onvif.org/ver10/network/wsdl"
     )
     assert DEVICE_NAME in root.findtext(".//d:Scopes", namespaces=ns)
+
+
+def test_discovery_replaces_stale_private_address_before_advertising(monkeypatch):
+    """WS-Discovery has no HTTP request Host, so use the active route IP."""
+
+    from lxml import etree
+
+    from aix5_ai import onvif_gateway as gateway_module
+    from aix5_ai.onvif_gateway import DISCOVERY, WSA_DISCOVERY
+
+    monkeypatch.setattr(gateway_module, "_local_ipv4", lambda: "198.51.100.6")
+    gateway = ONVIFGateway()
+    gateway.configure({}, lambda cid: [], "http://198.51.100.141:8080")
+    probe = (
+        f'<s:Envelope xmlns:s="{SOAP}" xmlns:a="{WSA_DISCOVERY}" xmlns:d="{DISCOVERY}">'
+        "<s:Header><a:MessageID>urn:uuid:address-probe</a:MessageID></s:Header>"
+        "<s:Body><d:Probe/></s:Body></s:Envelope>"
+    ).encode()
+    root = etree.fromstring(gateway.discovery_response(probe))
+    ns = {"d": DISCOVERY}
+    xaddrs = root.findtext(".//d:XAddrs", namespaces=ns)
+    assert xaddrs == "http://198.51.100.6:8080/onvif/device_service"
+    assert "198.51.100.141" not in xaddrs
 
 
 @pytest.mark.asyncio

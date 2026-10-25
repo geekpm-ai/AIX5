@@ -58,12 +58,4 @@ DEFAULT_SETTINGS = {
     "retention_days": 7,
     "max_event_storage_mb": 2048,
     "base_url": os.getenv("AIX5_BASE_URL", f"http://127.0.0.1:{PORT}"),
-    "mqtt": {
-        "enabled": False,
-        "host": "",
-        "port": 1883,
-        "username": "",
-        "password": "",
-        "tls": False,
-    },
 }

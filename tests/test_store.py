@@ -144,7 +144,7 @@ def test_legacy_settings_get_resolution_default_without_losing_configuration(tmp
     settings = store.get("settings")
     settings.pop("preview_resolution")
     settings["retention_days"] = 30
-    settings["mqtt"]["password"] = "keep-this"
+    settings["max_event_storage_mb"] = 4096
     store.set("settings", settings)
     store.close()
     store = Store(path)
@@ -152,7 +152,7 @@ def test_legacy_settings_get_resolution_default_without_losing_configuration(tmp
         actual = store.get("settings")
         assert actual["preview_resolution"] == "960x540"
         assert actual["retention_days"] == 30
-        assert actual["mqtt"]["password"] == "keep-this"
+        assert actual["max_event_storage_mb"] == 4096
     finally:
         store.close()
 

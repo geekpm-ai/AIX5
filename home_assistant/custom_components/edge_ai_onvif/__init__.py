@@ -15,7 +15,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_time_interval
 
 from .catalog import CatalogClient
-from .const import CONF_ONVIF_ENTRY_ID, DOMAIN, POLL_SECONDS
+from .const import CONF_ONVIF_ENTRY_ID, CONF_ONVIF_UNIQUE_ID, DOMAIN, POLL_SECONDS
 from .model import MigrationConflict, managed_uid, plan_migrations
 
 _LOGGER = logging.getLogger(__name__)
@@ -28,7 +28,8 @@ class RuleSync:
     def __init__(self, hass, entry):
         self.hass = hass
         self.entry = entry
-        self.source_id = entry.data[CONF_ONVIF_ENTRY_ID]
+        self.source_id = entry.data.get(CONF_ONVIF_ENTRY_ID, "")
+        self.source_unique_id = entry.data.get(CONF_ONVIF_UNIQUE_ID)
         self.client = None
         self.catalog = None
         self.gateway_id = None
@@ -42,8 +43,53 @@ class RuleSync:
 
     def source(self):
         source = self.hass.config_entries.async_get_entry(self.source_id)
-        if source is None or source.domain != "onvif":
-            raise ConfigEntryNotReady("The linked ONVIF integration is unavailable")
+        valid_states = {ConfigEntryState.LOADED, ConfigEntryState.NOT_LOADED}
+        if (
+            source is None
+            or source.domain != "onvif"
+            or source.state not in valid_states
+        ):
+            candidates = [
+                item for item in self.hass.config_entries.async_entries("onvif")
+                if self.source_unique_id
+                and item.unique_id == self.source_unique_id
+                and item.state in valid_states
+                and item.disabled_by is None
+            ]
+            # Older companion entries only stored the ONVIF entry ID. When
+            # Home Assistant recreated that entry, the old ID disappeared
+            # and there is no unique ID in the companion data to match. The
+            # companion title contains the original ONVIF title, so use that
+            # as a backwards-compatible migration key.
+            if not candidates:
+                companion_title = getattr(self.entry, "title", "") or ""
+                suffix = " 规则同步"
+                expected_title = (
+                    companion_title[: -len(suffix)].strip()
+                    if companion_title.endswith(suffix)
+                    else companion_title.strip()
+                )
+                if expected_title:
+                    candidates = [
+                        item
+                        for item in self.hass.config_entries.async_entries("onvif")
+                        if item.title == expected_title
+                        and item.state in valid_states
+                        and item.disabled_by is None
+                    ]
+            if len(candidates) != 1:
+                raise ConfigEntryNotReady("The linked ONVIF integration is unavailable")
+            source = candidates[0]
+            self.source_id = source.entry_id
+            self.source_unique_id = source.unique_id
+            self.hass.config_entries.async_update_entry(
+                self.entry,
+                data={
+                    **self.entry.data,
+                    CONF_ONVIF_ENTRY_ID: source.entry_id,
+                    CONF_ONVIF_UNIQUE_ID: source.unique_id,
+                },
+            )
         if source.state in {
             ConfigEntryState.SETUP_IN_PROGRESS,
             ConfigEntryState.UNLOAD_IN_PROGRESS,

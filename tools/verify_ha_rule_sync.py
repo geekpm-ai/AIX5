@@ -31,6 +31,40 @@ async def verify():
     from homeassistant.helpers import device_registry as dr
     from homeassistant.helpers import entity_registry as er
 
+    # A companion created by the previous component version only has the old
+    # native ONVIF entry ID. Verify that the title fallback can rebind it after
+    # Home Assistant recreates the native entry.
+    active_source = SimpleNamespace(
+        entry_id="active-native",
+        unique_id="stable-gateway",
+        domain="onvif",
+        disabled_by=None,
+        state=ConfigEntryState.LOADED,
+        title="Edge-AI-IPC",
+    )
+    legacy_companion = SimpleNamespace(
+        data={"onvif_entry_id": "removed-native"},
+        title="Edge-AI-IPC 规则同步",
+    )
+
+    class RebindEntries:
+        def async_get_entry(self, entry_id):
+            return active_source if entry_id == active_source.entry_id else None
+
+        def async_entries(self, domain):
+            return [active_source] if domain == "onvif" else []
+
+        def async_update_entry(self, entry, *, data):
+            entry.data = data
+
+    rebound = RuleSync(
+        SimpleNamespace(config_entries=RebindEntries()), legacy_companion
+    )
+    assert rebound.source() is active_source
+    assert legacy_companion.data["onvif_entry_id"] == active_source.entry_id
+    assert legacy_companion.data["onvif_unique_id"] == active_source.unique_id
+    assert rebound.source_unique_id == active_source.unique_id
+
     calls = []
     source = SimpleNamespace(
         entry_id="isolated-native",
@@ -167,6 +201,7 @@ async def verify():
                 "passed": True,
                 "checks": [
                     "public registry APIs",
+                    "legacy companion rebinds by native title",
                     "legacy identity migration retains entity_id",
                     "unload before migration and setup afterwards",
                     "rename retains automation identity",

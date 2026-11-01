@@ -222,3 +222,40 @@ def test_legacy_timezone_default_preserves_account_cameras_rules_and_event_times
         assert store.events() == events
     finally:
         store.close()
+
+
+def test_event_keyset_pagination_keeps_equal_timestamps_and_new_inserts(store, tmp_path):
+    for index in range(125):
+        store.insert_event(event(tmp_path, f"e{index:04}", created=1000 + index // 25))
+    first = store.event_page(limit=30)
+    assert first["total"] == 125 and first["has_more"]
+    collected = first["items"]
+    # A new event above the cursor must not shift later pages or duplicate data.
+    store.insert_event(event(tmp_path, "later", created=1010))
+    while True:
+        row = collected[-1]
+        page = store.event_page(cursor=(row["created"], row["id"]), limit=30)
+        assert page["total"] == 126
+        collected.extend(page["items"])
+        if not page["has_more"]:
+            break
+    assert len(collected) == len({row["id"] for row in collected}) == 125
+    assert [row["id"] for row in collected] == [f"e{i:04}" for i in reversed(range(125))]
+
+
+def test_event_range_filters_page_counts_and_complete_day_histogram(store, tmp_path):
+    for index in range(620):
+        item = event(tmp_path, f"e{index:04}", created=1000 + index)
+        item["camera_id"] = "a" if index % 2 else "b"
+        item["target_type"] = "person" if index % 3 else "cat"
+        store.insert_event(item)
+    page = store.event_page("a", target_type="person", start=1100, end=1400, limit=20)
+    expected = [i for i in range(100, 400) if i % 2 and i % 3]
+    assert page["total"] == len(expected)
+    assert len(page["items"]) == 20
+    assert all(1100 <= item["created"] < 1400 for item in page["items"])
+    histogram = store.event_timeline(1000, 2000)
+    assert histogram == {0: 300, 1: 300, 2: 20}
+    filtered = store.event_timeline(1100, 1400, "a", target_type="person")
+    assert sum(filtered.values()) == len(expected)
+    assert store.event_summary() == {"total": 620, "oldest": 1000, "newest": 1619, "event_bytes": 2480}

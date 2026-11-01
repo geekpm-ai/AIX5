@@ -48,6 +48,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS detections(id TEXT PRIMARY KEY,camera_id TEXT NOT NULL,
           created REAL NOT NULL,payload TEXT NOT NULL,image_path TEXT NOT NULL,size INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS detection_time ON detections(created);
+        CREATE INDEX IF NOT EXISTS detection_page ON detections(created DESC,id DESC);
         CREATE INDEX IF NOT EXISTS detection_camera ON detections(camera_id,created);
         CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,expires REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS onvif_nonces(nonce_hash TEXT PRIMARY KEY,expires REAL NOT NULL);
@@ -347,8 +348,8 @@ class Store:
             if temp_path:
                 temp_path.unlink(missing_ok=True)
 
-    @synchronized
-    def events(self, cid=None, limit=100, event_type=None, target_type=None):
+    @staticmethod
+    def _event_filter(cid=None, event_type=None, target_type=None, start=None, end=None):
         clauses, args = [], []
         for column, value in [
             ("camera_id", cid),
@@ -358,12 +359,64 @@ class Store:
             if value:
                 clauses.append(column + "=?")
                 args.append(value)
-        sql = "SELECT payload FROM detections"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created DESC LIMIT ?"
-        args.append(int(limit))
-        return [json.loads(row["payload"]) for row in self.db.execute(sql, args)]
+        if start is not None:
+            clauses.append("created>=?")
+            args.append(start)
+        if end is not None:
+            clauses.append("created<?")
+            args.append(end)
+        return clauses, args
+
+    @synchronized
+    def events(self, cid=None, limit=100, event_type=None, target_type=None,
+               start=None, end=None):
+        return self.event_batch(cid, event_type, target_type, start, end, limit=limit)
+
+    @synchronized
+    def event_batch(self, cid=None, event_type=None, target_type=None, start=None,
+                    end=None, cursor=None, limit=60):
+        """Fetch one bounded batch, with a stable tie-breaker for equal timestamps."""
+        clauses, args = self._event_filter(cid, event_type, target_type, start, end)
+        if cursor is not None:
+            clauses.append("(created,id)<(?,?)")
+            args.extend(cursor)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.db.execute(
+            "SELECT id,created,payload FROM detections" + where
+            + " ORDER BY created DESC,id DESC LIMIT ?", [*args, int(limit)]
+        ).fetchall()
+        # The indexed columns are authoritative even for legacy payloads.
+        return [{**json.loads(row["payload"]), "id": row["id"], "created": row["created"]}
+                for row in rows]
+
+    @synchronized
+    def event_page(self, cid=None, event_type=None, target_type=None, start=None,
+                   end=None, cursor=None, limit=60):
+        clauses, args = self._event_filter(cid, event_type, target_type, start, end)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        total = self.db.execute("SELECT COUNT(*) FROM detections" + where, args).fetchone()[0]
+        rows = self.event_batch(cid, event_type, target_type, start, end, cursor, limit + 1)
+        return {"items": rows[:limit], "total": total, "has_more": len(rows) > limit}
+
+    @synchronized
+    def event_timeline(self, start, end, cid=None, event_type=None, target_type=None,
+                       bucket_seconds=300):
+        """Count the entire day, independent of the list's page size."""
+        clauses, args = self._event_filter(cid, event_type, target_type, start, end)
+        rows = self.db.execute(
+            "SELECT CAST((created-?)/? AS INTEGER) AS bucket,COUNT(*) AS count "
+            "FROM detections WHERE " + " AND ".join(clauses) + " GROUP BY bucket",
+            [start, bucket_seconds, *args],
+        ).fetchall()
+        return {row["bucket"]: row["count"] for row in rows}
+
+    @synchronized
+    def event_summary(self):
+        row = self.db.execute(
+            "SELECT COUNT(*) AS total,MIN(created) AS oldest,MAX(created) AS newest,"
+            "COALESCE(SUM(size),0) AS event_bytes FROM detections"
+        ).fetchone()
+        return dict(row)
 
     @synchronized
     def event(self, eid):

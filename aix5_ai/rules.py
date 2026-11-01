@@ -22,6 +22,26 @@ def contains(point, polygon):
     return inside
 
 
+def matching_detections(detections, rule, label, image_size=None):
+    """Use the same target, confidence and footpoint test for rules and images."""
+    if not rule.get("enabled", True) or label not in rule["target_labels"]:
+        return []
+    zone = rule.get("zone", [])
+    if zone and (not image_size or min(image_size) <= 0):
+        raise ValueError("区域规则需要有效的原始图像宽高")
+    width, height = image_size or (1, 1)
+    return [
+        detection for detection in detections
+        if detection["label"] == label
+        and detection["confidence"] >= rule["confidence_threshold"]
+        and contains(
+            ((detection["bbox"][0] + detection["bbox"][2]) / (2 * width),
+             detection["bbox"][3] / height),
+            zone,
+        )
+    ]
+
+
 @dataclass
 class State:
     hits: int = 0
@@ -52,7 +72,6 @@ class RuleEngine:
         if any(r["enabled"] and r["zone"] for r in rules):
             if not image_size or min(image_size) <= 0:
                 raise ValueError("区域规则需要有效的原始图像宽高")
-        width, height = image_size or (1, 1)
         valid_keys = {
             (cid, r["id"], label)
             for r in rules
@@ -72,19 +91,7 @@ class RuleEngine:
             for label in rule["target_labels"]:
                 key = (cid, rule["id"], label)
                 s = self.states.setdefault(key, State())
-                matches = [
-                    d
-                    for d in detections
-                    if d["label"] == label
-                    and d["confidence"] >= rule["confidence_threshold"]
-                    and contains(
-                        (
-                            (d["bbox"][0] + d["bbox"][2]) / (2 * width),
-                            d["bbox"][3] / height,
-                        ),
-                        rule["zone"],
-                    )
-                ]
+                matches = matching_detections(detections, rule, label, image_size)
                 if matches:
                     if rule.get("absence_seconds"):
                         # A returning target clears an absence alert episode;

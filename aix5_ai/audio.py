@@ -16,7 +16,9 @@ from fractions import Fraction
 
 import numpy as np
 from aiortc import AudioStreamTrack
-from av import AudioFrame
+from aiortc.codecs.opus import OpusEncoder
+from aiortc.mediastreams import MediaStreamError
+from av import AudioFrame, Packet
 
 from .media_scheduling import ProcessReadWatchdog, terminate_process
 
@@ -49,6 +51,8 @@ class AudioSource:
         self.changed = asyncio.Event()
         self.started = None
         self.rate_samples = 0
+        self.opus_pipeline = None
+        self._opus_tasks = set()
 
     async def start(self):
         if self.task is None or self.task.done():
@@ -56,6 +60,13 @@ class AudioSource:
             self.task = asyncio.create_task(self.run())
 
     async def stop(self):
+        pipeline, self.opus_pipeline = self.opus_pipeline, None
+        if pipeline is not None:
+            await pipeline.close()
+        # A final viewer may already have detached a pipeline whose codec
+        # thread is still finishing its batch. Join that cleanup as well.
+        if self._opus_tasks:
+            await asyncio.gather(*tuple(self._opus_tasks), return_exceptions=True)
         if self.task:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
@@ -213,40 +224,102 @@ class AudioSource:
 
 
 class CameraAudioTrack(AudioStreamTrack):
+    # RTSP and FFmpeg deliver PCM in bursts. Waiting across normal bursts lets
+    # the receiver's jitter buffer play the complete source sample sequence.
+    # Only a real input interruption should introduce locally generated silence.
+    idle_timeout = 0.5
+    stale_timeout = 1.0
+
     def __init__(self, source):
         super().__init__()
         self.source = source
-        self.last_sequence = 0
+        self.last_sequence = None
         self.pts = 0
-        self.next_at = None
         self.epoch = None
+        self.origin_sequence = None
+        self.origin_pts = 0
+        self._resync = False
+        self._stopped = asyncio.Event()
+
+    def stop(self):
+        super().stop()
+        self._stopped.set()
+
+    async def _wait_for_input(self, changed, timeout):
+        # wait() preserves cancellation on the board's Python 3.10 even when
+        # input arrives in the same event-loop turn as a peer is being closed.
+        waiting = {
+            asyncio.create_task(changed.wait()),
+            asyncio.create_task(self._stopped.wait()),
+        }
+        try:
+            await asyncio.wait(
+                waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in waiting:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*waiting, return_exceptions=True)
 
     async def recv(self):
-        now = time.monotonic()
         if self.epoch is None:
-            self.epoch = now
-        # Preserve wall-clock audio time after scheduler stalls. Resetting the
-        # deadline while adding only 20 ms to PTS makes audio progressively
-        # slower than video and the browser drops video to stay synchronized.
-        slot = max(self.pts // SAMPLES, int((now - self.epoch) / 0.02))
-        self.next_at = self.epoch + slot * 0.02
-        if self.next_at > now:
-            await asyncio.sleep(self.next_at - now)
-        self.pts = slot * SAMPLES
-        chunks = self.source.chunks
-        # Start near live edge; never play a backlog after a browser stalls.
-        if chunks and (
-            self.last_sequence < chunks[0][0] or chunks[-1][0] - self.last_sequence > 5
-        ):
-            self.last_sequence = max(chunks[0][0] - 1, chunks[-1][0] - 2)
-        pcm = bytes(SAMPLES * 2)
-        if chunks and time.monotonic() - chunks[-1][1] < 1:
-            candidate = next(
-                (item for item in chunks if item[0] > self.last_sequence), None
-            )
+            self.epoch = time.monotonic()
+        while self.readyState == "live":
+            # Capture the wake-up event before inspecting PCM to avoid losing
+            # a notification between checking an empty ring and waiting.
+            changed = self.source.changed
+            chunks = self.source.chunks
+            now = time.monotonic()
+            candidate = None
+            if chunks and now - chunks[-1][1] < self.stale_timeout:
+                if self.last_sequence is None:
+                    # A new viewer starts live; once started, consume every
+                    # retained chunk, including an entire 200-400 ms burst.
+                    candidate = chunks[-1]
+                else:
+                    candidate = next(
+                        (
+                            item
+                            for item in chunks
+                            if item[0] > self.last_sequence
+                            and now - item[1] < self.stale_timeout
+                        ),
+                        None,
+                    )
             if candidate:
-                self.last_sequence = candidate[0]
+                sequence = candidate[0]
+                if self.origin_sequence is None or self._resync:
+                    self.origin_sequence = sequence
+                    self.origin_pts = max(
+                        self.pts, int((now - self.epoch) * RATE) // SAMPLES * SAMPLES
+                    )
+                    self._resync = False
+                # Sequence gaps only occur when the bounded source ring was
+                # actually overwritten. Preserve their duration in RTP time.
+                self.pts = self.origin_pts + (
+                    sequence - self.origin_sequence
+                ) * SAMPLES
+                self.last_sequence = sequence
                 pcm = candidate[2]
+                break
+            last_input = chunks[-1][1] if chunks else self.epoch
+            deadline = max(
+                last_input + self.idle_timeout, self.epoch + self.pts / RATE
+            )
+            if now < deadline:
+                await self._wait_for_input(changed, deadline - now)
+                continue
+            # Keep an unavailable/disabled source alive with paced silence, but
+            # never spend ordinary packetization gaps inserting fake samples.
+            self.pts = max(
+                self.pts, int((now - self.epoch) * RATE) // SAMPLES * SAMPLES
+            )
+            self._resync = True
+            pcm = bytes(SAMPLES * 2)
+            break
+        else:
+            raise MediaStreamError
         frame = AudioFrame(format="s16", layout="mono", samples=SAMPLES)
         frame.planes[0].update(pcm)
         frame.sample_rate = RATE
@@ -254,3 +327,139 @@ class CameraAudioTrack(AudioStreamTrack):
         frame.pts = self.pts
         self.pts += SAMPLES
         return frame
+
+
+class _OpusPipeline:
+    """Encode a camera's PCM once, in batches, for all browser viewers."""
+
+    def __init__(self, source):
+        self.source = source
+        self.subscribers = set()
+        self.task = None
+        self._stopping = False
+
+    def subscribe(self, track):
+        self.subscribers.add(track)
+        if self.task is None:
+            self.task = asyncio.create_task(self.run())
+            self.source._opus_tasks.add(self.task)
+            self.task.add_done_callback(self.source._opus_tasks.discard)
+
+    def request_stop(self):
+        if not self._stopping:
+            self._stopping = True
+            if self.task and not self.task.done():
+                self.task.cancel()
+
+    def unsubscribe(self, track):
+        self.subscribers.discard(track)
+        if not self.subscribers:
+            if self.source.opus_pipeline is self:
+                self.source.opus_pipeline = None
+            self.request_stop()
+
+    async def close(self):
+        for track in tuple(self.subscribers):
+            track.stop()
+        if self.task:
+            self.request_stop()
+            await asyncio.gather(self.task, return_exceptions=True)
+
+    @staticmethod
+    def encode_batch(encoder, frames):
+        packets = []
+        for frame in frames:
+            payloads, timestamp = encoder.encode(frame)
+            packets.extend(
+                (payload, timestamp + index * SAMPLES)
+                for index, payload in enumerate(payloads)
+            )
+        return packets
+
+    async def run(self):
+        cursor = CameraAudioTrack(self.source)
+        encoder = OpusEncoder()
+        try:
+            while self.subscribers:
+                frames = [await cursor.recv()]
+                # A single executor round-trip per available batch avoids a
+                # video-loaded event loop delaying every individual audio frame.
+                # The source ring already bounds a batch to 400 ms of PCM.
+                while (
+                    len(frames) < 20
+                    and self.source.chunks
+                    and cursor.last_sequence is not None
+                    and self.source.chunks[-1][0] > cursor.last_sequence
+                    and time.monotonic() - self.source.chunks[-1][1]
+                    < cursor.stale_timeout
+                ):
+                    frames.append(await cursor.recv())
+                encoding = asyncio.create_task(
+                    asyncio.to_thread(self.encode_batch, encoder, frames)
+                )
+                try:
+                    packets = await asyncio.shield(encoding)
+                except asyncio.CancelledError:
+                    # The codec belongs to this worker until the batch exits.
+                    # Never free it while its executor thread is still running.
+                    await encoding
+                    raise
+                for packet in packets:
+                    for track in tuple(self.subscribers):
+                        track.enqueue(packet)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            for track in tuple(self.subscribers):
+                track.enqueue(exc)
+        finally:
+            cursor.stop()
+            if self.source.opus_pipeline is self:
+                self.source.opus_pipeline = None
+
+
+class EncodedCameraAudioTrack(AudioStreamTrack):
+    """A bounded per-viewer Opus packet cursor; the camera owns encoding."""
+
+    def __init__(self, source):
+        super().__init__()
+        self.source = source
+        self.pipeline = None
+        self.queue = asyncio.Queue(maxsize=20)
+        self.first_pts = None
+
+    def enqueue(self, packet):
+        if self.queue.full():
+            self.queue.get_nowait()
+        self.queue.put_nowait(packet)
+
+    async def recv(self):
+        if self.readyState != "live":
+            raise MediaStreamError
+        if self.pipeline is None:
+            pipeline = self.source.opus_pipeline
+            if pipeline is None or (pipeline.task and pipeline.task.done()):
+                pipeline = self.source.opus_pipeline = _OpusPipeline(self.source)
+            self.pipeline = pipeline
+            pipeline.subscribe(self)
+        data = await self.queue.get()
+        if isinstance(data, Exception):
+            self.stop()
+            raise data
+        payload, pts = data
+        if self.first_pts is None:
+            self.first_pts = pts
+        packet = Packet(payload)
+        packet.pts = packet.dts = pts - self.first_pts
+        packet.time_base = Fraction(1, RATE)
+        return packet
+
+    def stop(self):
+        super().stop()
+        pipeline, self.pipeline = self.pipeline, None
+        if pipeline is not None:
+            pipeline.unsubscribe(self)
+        # Wake a sender awaiting input even when the source is disconnected.
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.enqueue(MediaStreamError())

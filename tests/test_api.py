@@ -5,6 +5,7 @@ import time
 from unittest.mock import AsyncMock
 
 import httpx
+import cv2
 import numpy as np
 import pytest
 
@@ -363,8 +364,9 @@ async def test_cancelled_bpu_thread_keeps_semaphore_until_finished():
     assert not semaphore.locked()
 
 
-async def test_rule_event_uses_inference_frame_without_waiting_for_preview_cache(
-    client, monkeypatch
+@pytest.mark.parametrize("capture_jpeg", [None, b"unannotated-capture"])
+async def test_rule_event_saves_boxes_on_inference_frame_without_changing_preview(
+    client, monkeypatch, capture_jpeg
 ):
     await login(client)
     cid = (
@@ -389,16 +391,18 @@ async def test_rule_event_uses_inference_frame_without_waiting_for_preview_cache
             return {
                 "latency_ms": 1,
                 "detections": [
-                    {"class_id": 0, "confidence": 0.9, "bbox": [2, 2, 10, 14]}
+                    {"class_id": 0, "confidence": 0.9, "bbox": [24, 28, 100, 92]}
                 ],
             }
 
     monkeypatch.setattr(main, "get_detector", lambda _: Detector())
-    monkeypatch.setattr(main, "make_web_preview", lambda _: b"inference-frame")
     main.manager.frames[cid] = b"unrelated-preview"
     camera = main.manager.cameras[cid]
+    frame = np.full((120, 160, 3), (32, 40, 48), np.uint8)
+    original = frame.copy()
+    main.manager.images[cid] = frame
     main.manager.frame_queues[cid].put_nowait(
-        (np.zeros((16, 16, 3), np.uint8), None, main.manager.generations[cid])
+        (frame, capture_jpeg, main.manager.generations[cid])
     )
 
     async def wait_event():
@@ -409,7 +413,22 @@ async def test_rule_event_uses_inference_frame_without_waiting_for_preview_cache
     event = main.store.events()[0]
     from pathlib import Path
 
-    assert Path(event["image_path"]).read_bytes() == b"inference-frame"
+    image = Path(event["image_path"]).read_bytes()
+    decoded = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_COLOR)
+    assert decoded.shape == frame.shape
+    # The red target border is actually in the stored JPEG, while the
+    # subject's interior and the shared preview/inference frame stay untouched.
+    blue, green, red = map(int, decoded[28, 60])
+    assert red > blue + 70 and red > green + 70
+    assert np.max(np.abs(decoded[60, 60].astype(int) - original[60, 60])) < 5
+    assert np.array_equal(frame, original)
+    assert main.manager.images[cid] is frame
+    assert main.manager.frames[cid] == b"unrelated-preview"
+    response_image = await client.get(f"/api/events/{event['id']}/image")
+    assert response_image.status_code == 200
+    assert response_image.headers["content-type"] == "image/jpeg"
+    assert response_image.content == image
+    assert camera["detection_payload"]["detections"][0]["bbox"] == [24, 28, 100, 92]
     assert event["rule_id"] == response.json()["id"]
     assert camera["present"]["person"]
 
@@ -539,7 +558,7 @@ async def test_rule_condition_edit_during_event_persistence_cannot_publish_old_t
         release.wait(timeout=3)
 
     monkeypatch.setattr(main, "get_detector", lambda _: Detector())
-    monkeypatch.setattr(main, "make_web_preview", lambda _: b"frame")
+    monkeypatch.setattr(main, "make_event_snapshot", lambda *_: b"frame")
     monkeypatch.setattr(main.store, "insert_event", persist)
     main.manager.frame_queues[cid].put_nowait(
         (np.zeros((16, 16, 3), np.uint8), None, main.manager.generations[cid])
@@ -857,3 +876,179 @@ async def test_timezone_settings_persist_validate_and_do_not_rewrite_utc_events(
         assert main.store.get("settings")["timezone"] == "Asia/Shanghai"
     updated = (await client.get("/api/settings")).json()
     assert updated == original_settings
+
+
+def insert_query_events(count, *, start=1792857600.0, step=1):
+    """Use one transaction for query fixtures; image bytes are irrelevant here."""
+    import json
+    records = []
+    for index in range(count):
+        item = {"id": f"query-{index:05}", "camera_id": "query-camera",
+                "camera_name": "门口", "created": start + index * step,
+                "timestamp": main.datetime.datetime.fromtimestamp(start + index * step, main.datetime.timezone.utc).isoformat(),
+                "event_type": "target_detected", "target_type": "person",
+                "size": 4, "image_path": str(main.EVENTS / f"query-{index:05}.jpg")}
+        records.append((item["id"], item["camera_id"], item["created"], json.dumps(item), item["image_path"], item["size"]))
+    with main.store._lock, main.store.db:
+        main.store.db.executemany("INSERT INTO detections VALUES (?,?,?,?,?,?)", records)
+
+
+async def test_event_page_queries_all_rows_and_summary_instead_of_hiding_after_100(client):
+    await login(client)
+    insert_query_events(620, step=0)
+    seen, cursor = [], None
+    while True:
+        params = {"limit": 73}
+        if cursor:
+            params["cursor"] = cursor
+        response = await client.get("/api/events/page", params=params)
+        assert response.status_code == 200, response.text
+        page = response.json()
+        assert page["total"] == 620
+        assert all("/api/events/" in item["screenshot_url"] for item in page["items"])
+        seen.extend(item["id"] for item in page["items"])
+        cursor = page["next_cursor"]
+        if not page["has_more"]:
+            assert cursor is None
+            break
+    assert len(seen) == len(set(seen)) == 620
+    assert seen == sorted(seen, reverse=True)
+    summary = (await client.get("/api/events/summary")).json()
+    assert summary["total"] == 620 and summary["event_bytes"] == 2480
+    assert summary["retention_days"] == 7 and summary["max_event_storage_mb"] == 2048
+
+
+async def test_event_local_time_filters_and_timeline_include_entire_day(client):
+    await login(client)
+    # Oct 30 local midnight (UTC+8), then one event every 5 seconds.
+    start = main.datetime.datetime(2026, 10, 29, 16, tzinfo=main.datetime.timezone.utc).timestamp()
+    insert_query_events(620, start=start, step=5)
+    timeline = (await client.get("/api/events/timeline", params={"date": "2026-10-30"})).json()
+    assert timeline["timezone"] == "Asia/Shanghai"
+    assert timeline["start"] == start and timeline["end"] - start == 86400
+    assert timeline["total"] == 620
+    assert sum(bucket["count"] for bucket in timeline["buckets"]) == 620
+    assert timeline["buckets"][0]["count"] == 60
+    assert timeline["buckets"][10]["count"] == 20
+    params = {"start": "2026-10-30T00:05:00", "end": "2026-10-30T00:10:00"}
+    page = (await client.get("/api/events/page", params=params)).json()
+    assert page["total"] == 60
+    assert all(start + 300 <= item["created"] < start + 600 for item in page["items"])
+    aware = {"start": "2026-10-29T16:05:00Z", "end": str(start + 600)}
+    assert (await client.get("/api/events/page", params=aware)).json() == page
+    assert len((await client.get("/api/events", params=params)).json()) == 60
+    assert (await client.get("/api/events/timeline", params={"date":"2026-10-30", "camera_id":"other"})).json()["total"] == 0
+
+
+async def test_event_timeline_uses_calendar_days_across_dst_and_validates_input(client):
+    await login(client)
+    settings = main.store.get("settings")
+    main.store.set("settings", {**settings, "timezone": "America/New_York"})
+    for day, hours in [("2026-03-08", 23), ("2026-11-01", 25)]:
+        response = await client.get("/api/events/timeline", params={"date":day})
+        assert response.status_code == 200
+        timeline = response.json()
+        assert timeline["end"] - timeline["start"] == hours * 3600
+        assert len(timeline["buckets"]) == hours * 12
+    for params in [{"start":"bad"}, {"start":"nan"}, {"start":"inf"},
+                   {"start":"2026-03-08T02:30:00"},
+                   {"start":"2026-10-30T10:00", "end":"2026-10-30T09:00"},
+                   {"cursor":"invalid!"}, {"cursor":base64.urlsafe_b64encode(b'[true,"id"]').decode()},
+                   {"limit":0}, {"limit":201}]:
+        assert (await client.get("/api/events/page", params=params)).status_code == 422
+    assert (await client.get("/api/events/timeline", params={"date":"2026-02-30"})).status_code == 422
+    assert (await client.get("/api/events/export", params={"format":"xml"})).status_code == 422
+    await client.post("/api/auth/logout")
+    for path in ["/api/events/page", "/api/events/timeline?date=2026-10-30", "/api/events/summary", "/api/events/export"]:
+        assert (await client.get(path)).status_code == 401
+
+
+async def test_event_exports_are_complete_beyond_5000_and_apply_the_same_range(client):
+    import csv
+    import io
+
+    await login(client)
+    insert_query_events(5105, start=1000000, step=1)
+    response = await client.get("/api/events/export", params={"format":"json"})
+    assert response.status_code == 200
+    items = response.json()
+    assert len(items) == len({item["id"] for item in items}) == 5105
+    assert items[0]["id"] == "query-05104" and items[-1]["id"] == "query-00000"
+    assert "/api/events/query-05104/image?token=" in items[0]["screenshot_url"]
+    response = await client.get("/api/events/export", params={"format":"csv"})
+    csv_rows = list(csv.DictReader(io.StringIO(response.content.decode("utf-8-sig"))))
+    assert len(csv_rows) == 5105 and csv_rows[0]["camera_name"] == "门口"
+    params = {"format":"json", "start":"1000300", "end":"1000400"}
+    filtered = (await client.get("/api/events/export", params=params)).json()
+    assert len(filtered) == 100
+    assert all(1000300 <= item["created"] < 1000400 for item in filtered)
+
+
+async def test_simultaneous_events_only_annotate_their_own_rule_matches(client, monkeypatch):
+    """Each event keeps all its matches, even for a rule with multiple labels."""
+    from pathlib import Path
+    from aix5_ai.rules import State
+
+    await login(client)
+    cid = (await client.post('/api/cameras', json={
+        'name': '门口', 'rtsp_url': 'rtsp://localhost'
+    })).json()['id']
+    await asyncio.sleep(0)
+    rules = []
+    for config in [
+        {'name': '左侧有人', 'target_labels': ['person'], 'confidence_threshold': .8,
+         'zone': [[0, 0], [.45, 0], [.45, 1], [0, 1]]},
+        {'name': '有猫', 'target_labels': ['cat'], 'confidence_threshold': .5},
+        {'name': '右侧没有人', 'target_labels': ['person'], 'confidence_threshold': .8,
+         'zone': [[.9, 0], [1, 0], [1, 1], [.9, 1]], 'absence_seconds': 60},
+        {'name': '全图有人或猫', 'target_labels': ['person', 'cat'], 'confidence_threshold': .8},
+    ]:
+        response = await client.post(f'/api/cameras/{cid}/rules', json={**config, 'min_hits': 1})
+        assert response.status_code == 200, response.text
+        rules.append(response.json())
+    main.engine.states[(cid, rules[2]['id'], 'person')] = State(absence_since=time.time()-61)
+    detections = [
+        {'class_id': 0, 'confidence': .95, 'bbox': [20, 20, 100, 160]},
+        {'class_id': 0, 'confidence': .6, 'bbox': [120, 25, 160, 140]},
+        {'class_id': 0, 'confidence': .95, 'bbox': [280, 20, 350, 160]},
+        {'class_id': 15, 'confidence': .9, 'bbox': [185, 65, 245, 145]},
+        {'class_id': 0, 'confidence': .85, 'bbox': [110, 150, 160, 190]},
+    ]
+
+    class Detector:
+        def infer(self, frame):
+            return {'latency_ms': 1, 'detections': detections}
+
+    monkeypatch.setattr(main, 'get_detector', lambda _: Detector())
+    frame = np.full((200, 400, 3), 128, np.uint8)
+    main.manager.frame_queues[cid].put_nowait((frame, b'unannotated', main.manager.generations[cid]))
+
+    async def wait_events():
+        while len(main.store.events()) < 5:
+            await asyncio.sleep(.01)
+
+    await asyncio.wait_for(wait_events(), 3)
+    events_by_target = {(e['rule_id'], e['target_type']): e for e in main.store.events()}
+    assert len(events_by_target) == 5
+    expected = [
+        (0, 'person', [True, False, False, False, True]),
+        (1, 'cat', [False, False, False, True, False]),
+        (2, 'person', [False, False, False, False, False]),
+        (3, 'person', [True, False, True, False, True]),
+        (3, 'cat', [False, False, False, True, False]),
+    ]
+    for index, label, expected_borders in expected:
+        event = events_by_target[(rules[index]['id'], label)]
+        decoded = cv2.imdecode(np.frombuffer(Path(event['image_path']).read_bytes(), np.uint8), cv2.IMREAD_COLOR)
+        b, g, r = np.moveaxis(decoded.astype(np.int16), -1, 0)
+        red = (r > 150) & (r-g > 50) & (r-b > 50)
+        # Sample each top border: two qualifying people, a low-confidence
+        # person, an out-of-zone person, and a different target category.
+        borders = [bool(red[y, x]) for x,y in [(60,20),(140,25),(315,20),(215,65),(135,150)]]
+        assert borders == expected_borders, (event['rule_name'], label, borders)
+        if index == 2:
+            assert event['event_type'] == 'target_absent'
+            assert not red.any()
+    assert np.all(frame == 128)
+    # Live metadata keeps every enabled detection; screenshot filtering is local.
+    assert len(main.manager.cameras[cid]['detection_payload']['detections']) == 5

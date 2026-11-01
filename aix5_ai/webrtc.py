@@ -19,8 +19,9 @@ from aiortc import (
     VideoStreamTrack,
 )
 from av import VideoFrame
+from aiortc.sdp import SessionDescription
 
-from .audio import CameraAudioTrack
+from .audio import CameraAudioTrack, EncodedCameraAudioTrack
 from .codec_tuning import install_h264_tuning
 from .hw_capture import manager
 from .media_scheduling import (
@@ -594,17 +595,38 @@ async def create_offer_answer(camera_id, offer_sdp, offer_type, mode="grid"):
         track = EncodedCameraTrack(camera_id, mode=mode)
         sender = pc.addTrack(track)
         # Older clients may offer video only; attach audio only when negotiated.
-        has_audio = (
-            any(t.kind == "audio" for t in pc.getTransceivers())
-            or "\nm=audio " in offer_sdp
-        )
+        audio_media = [
+            media for media in SessionDescription.parse(offer_sdp).media
+            if media.kind == "audio"
+        ][:1]  # This endpoint attaches one audio sender to the first audio m-line.
         audio_source = manager.audio_sources.get(camera_id)
         if (
-            has_audio
+            audio_media
             and audio_source
             and manager.cameras.get(camera_id, {}).get("audio_present") is not False
         ):
-            pc.addTrack(CameraAudioTrack(audio_source))
+            opus = [
+                codec for codec in RTCRtpSender.getCapabilities("audio").codecs
+                if codec.mimeType.lower() == "audio/opus"
+                and any(
+                    offered.mimeType.lower() == codec.mimeType.lower()
+                    and offered.clockRate == codec.clockRate
+                    and offered.channels == codec.channels
+                    for media in audio_media for offered in media.rtp.codecs
+                )
+            ]
+            audio_sender = pc.addTrack(
+                EncodedCameraAudioTrack(audio_source)
+                if opus else CameraAudioTrack(audio_source)
+            )
+            if opus:
+                audio_transceiver = next(
+                    item for item in pc.getTransceivers()
+                    if item.sender is audio_sender
+                )
+                # Pre-encoded packets must only be negotiated as Opus. Other
+                # clients keep the raw PCM path for aiortc codec conversion.
+                audio_transceiver.setCodecPreferences(opus)
 
         # The browser creates the SCTP data channel before making its offer. The
         # server only receives that channel here; creating a new server-side

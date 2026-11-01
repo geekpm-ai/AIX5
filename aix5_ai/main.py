@@ -1,14 +1,18 @@
 from __future__ import annotations
 import asyncio, datetime, logging, os, time, uuid, csv, io, json, re
 import ipaddress
+import base64
+import math
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 from fastapi import (
     Cookie,
     Depends,
     FastAPI,
     HTTPException,
+    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
@@ -19,7 +23,8 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, InvalidHashError
 from .config import CAPTURE_BIN, EVENTS, HOST, PORT, MODELS, DEFAULT_SETTINGS, model_confidence_threshold
 from . import codec_tuning
-from .hw_capture import manager, make_web_preview
+from .hw_capture import manager
+from .event_images import make_event_snapshot
 from .inference import (
     get_detector,
     hbm_runtime,
@@ -40,7 +45,7 @@ from .onvif_gateway import (
 )
 from .onvif_events import OnvifEventHub
 from .rtsp_output import RtspOutputManager
-from .rules import RuleEngine
+from .rules import RuleEngine, matching_detections
 from .schemas import (
     CameraConfig,
     CameraPatch,
@@ -391,12 +396,6 @@ async def inference_loop(cid):
             if not events:
                 onvif_events.sync_active(cid, engine.active_rules(cid))
                 continue
-            # Encode the frame that produced these detections, not a newer JPEG cache.
-            image = jpg or await run_worker(make_web_preview, bgr)
-            if not image:
-                raise RuntimeError("事件截图编码失败")
-            if generation != manager.generations.get(cid):
-                continue
             settings = _reconcile_saved_base_url(store.get("settings"))
             base = settings.get("base_url", "").rstrip("/")
 
@@ -417,6 +416,18 @@ async def inference_loop(cid):
 
             for event in events:
                 if not rule_event_is_current(event):
+                    continue
+                # Each event has its own relevant targets, even when several
+                # rules fire on the same frame. Absence events have no target
+                # to outline, including when a person is outside the zone.
+                boxes = [] if event["event_type"] == "target_absent" else matching_detections(
+                    detections, evaluated_rules[event["rule_id"]],
+                    event["target_type"], (width, height),
+                )
+                image = await run_worker(make_event_snapshot, bgr, boxes)
+                if not image:
+                    raise RuntimeError("事件截图编码失败")
+                if generation != manager.generations.get(cid) or not rule_event_is_current(event):
                     continue
                 eid = str(uuid.uuid4())
                 payload = {
@@ -1027,6 +1038,127 @@ async def remove_rule(rid: str, _: bool = Depends(auth)):
     return {"ok": True}
 
 
+def _event_timezone():
+    return ZoneInfo(store.get("settings", {}).get("timezone", "Asia/Shanghai"))
+
+
+def _event_time(value, zone):
+    if value is None:
+        return None
+    try:
+        # Timeline values are UTC epoch seconds; date/time controls can submit
+        # ISO local time and are interpreted in the configured system timezone.
+        try:
+            stamp = float(value)
+        except (ValueError, TypeError):
+            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                local = parsed.replace(tzinfo=zone)
+                # Reject nonexistent wall times during a daylight-saving jump.
+                if datetime.datetime.fromtimestamp(local.timestamp(), zone).replace(tzinfo=None) != parsed:
+                    raise ValueError("nonexistent local time")
+                parsed = local
+            stamp = parsed.timestamp()
+        if not math.isfinite(stamp):
+            raise ValueError("non-finite time")
+        datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc)
+        return stamp
+    except (ValueError, TypeError, OverflowError, OSError) as exc:
+        raise HTTPException(422, "日期时间无效，请按系统时区选择有效时间") from exc
+
+
+def _event_time_range(start, end):
+    zone = _event_timezone()
+    first, last = _event_time(start, zone), _event_time(end, zone)
+    if first is not None and last is not None and first >= last:
+        raise HTTPException(422, "结束时间必须晚于开始时间")
+    return first, last
+
+
+def _event_cursor(value):
+    if value is None:
+        return None
+    try:
+        if len(value) > 1024:
+            raise ValueError("cursor too large")
+        raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list) or len(parsed) != 2:
+            raise ValueError("invalid cursor shape")
+        stamp, eid = parsed
+        if (type(stamp) not in (int, float) or not math.isfinite(stamp)
+                or not isinstance(eid, str) or not eid or len(eid) > 256):
+            raise ValueError("invalid cursor values")
+        stamp = float(stamp)
+        datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc)
+        return stamp, eid
+    except (ValueError, TypeError, OverflowError, OSError) as exc:
+        raise HTTPException(422, "分页位置无效，请重新筛选事件") from exc
+
+
+def _encode_event_cursor(row):
+    return base64.urlsafe_b64encode(
+        json.dumps([row["created"], row["id"]], separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+
+
+@app.get("/api/events/page")
+async def event_page(
+    request: Request,
+    camera_id: str | None = None,
+    event_type: str | None = None,
+    target_type: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    cursor: str | None = None,
+    limit: int = Query(default=60, ge=1, le=200),
+    _: bool = Depends(auth),
+):
+    first, last = _event_time_range(start, end)
+    page = await run_worker(store.event_page, camera_id, event_type, target_type,
+                            first, last, _event_cursor(cursor), limit)
+    page["next_cursor"] = (
+        _encode_event_cursor(page["items"][-1]) if page["has_more"] else None
+    )
+    page["items"] = _public_event_rows(page["items"], request)
+    return page
+
+
+@app.get("/api/events/timeline")
+async def event_timeline(
+    date: str,
+    camera_id: str | None = None,
+    event_type: str | None = None,
+    target_type: str | None = None,
+    _: bool = Depends(auth),
+):
+    try:
+        day = datetime.date.fromisoformat(date)
+        if day.isoformat() != date:
+            raise ValueError("expected YYYY-MM-DD")
+        zone = _event_timezone()
+        start = datetime.datetime.combine(day, datetime.time.min, zone).timestamp()
+        end = datetime.datetime.combine(day + datetime.timedelta(days=1), datetime.time.min, zone).timestamp()
+    except (ValueError, OverflowError) as exc:
+        raise HTTPException(422, "日期无效，请使用 YYYY-MM-DD") from exc
+    counts = await run_worker(store.event_timeline, start, end, camera_id, event_type, target_type)
+    buckets = [
+        {"start": start + index * 300, "end": min(end, start + (index + 1) * 300),
+         "count": counts.get(index, 0)}
+        for index in range(math.ceil((end - start) / 300))
+    ]
+    return {"date": date, "timezone": zone.key, "start": start, "end": end,
+            "now": time.time(), "total": sum(counts.values()), "buckets": buckets}
+
+
+@app.get("/api/events/summary")
+async def event_summary(_: bool = Depends(auth)):
+    summary = await run_worker(store.event_summary)
+    settings = store.get("settings", {})
+    return {**summary, "retention_days": settings.get("retention_days", 7),
+            "max_event_storage_mb": settings.get("max_event_storage_mb", 2048)}
+
+
 @app.get("/api/events")
 async def events(
     request: Request,
@@ -1034,9 +1166,13 @@ async def events(
     event_type: str | None = None,
     target_type: str | None = None,
     limit: int = 100,
+    start: str | None = None,
+    end: str | None = None,
     _: bool = Depends(auth),
 ):
-    rows = store.events(camera_id, max(1, min(limit, 500)), event_type, target_type)
+    first, last = _event_time_range(start, end)
+    rows = await run_worker(store.events, camera_id, max(1, min(limit, 500)),
+                            event_type, target_type, first, last)
     return _public_event_rows(rows, request)
 
 
@@ -1047,34 +1183,65 @@ async def export_events(
     camera_id: str | None = None,
     event_type: str | None = None,
     target_type: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
     _: bool = Depends(auth),
 ):
-    rows = store.events(camera_id, 5000, event_type, target_type)
-    rows = _public_event_rows(rows, request)
-    if format.lower() == "csv":
+    first, last = _event_time_range(start, end)
+    format = format.lower()
+    if format not in {"json", "csv"}:
+        raise HTTPException(422, "导出格式必须为 JSON 或 CSV")
+    # Resolve public addresses before headers are sent. Keep each DB read and
+    # serialization bounded; no transaction/lock is held while sending a chunk.
+    base = _sync_request_public_base(request)
+    token = store.get("ha_token")
+    export_store = store
+    fields = [
+        "id",
+        "timestamp",
+        "camera_name",
+        "event_type",
+        "target_type",
+        "confidence",
+        "screenshot_url",
+    ]
+
+    async def batches():
+        cursor = None
+        while True:
+            rows = await run_worker(export_store.event_batch, camera_id, event_type,
+                                    target_type, first, last, cursor, 500)
+            if not rows:
+                return
+            yield _public_event_rows(rows, request, base=base, token=token)
+            cursor = rows[-1]["created"], rows[-1]["id"]
+            if len(rows) < 500:
+                return
+
+    async def content():
+        if format == "json":
+            yield b"["
+            comma = False
+            async for rows in batches():
+                text = ",".join(json.dumps(row, ensure_ascii=False) for row in rows)
+                yield (("," if comma else "") + text).encode("utf-8")
+                comma = True
+            yield b"]"
+            return
         out = io.StringIO()
-        fields = [
-            "id",
-            "timestamp",
-            "camera_name",
-            "event_type",
-            "target_type",
-            "confidence",
-            "screenshot_url",
-        ]
         writer = csv.DictWriter(out, fieldnames=fields)
         writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fields})
-        return Response(
-            out.getvalue().encode("utf-8-sig"),
-            media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename="aix5-events.csv"'},
-        )
-    return Response(
-        json.dumps(rows, ensure_ascii=False, indent=2).encode("utf-8"),
-        media_type="application/json",
-        headers={"Content-Disposition": 'attachment; filename="aix5-events.json"'},
+        yield out.getvalue().encode("utf-8-sig")
+        async for rows in batches():
+            out.seek(0)
+            out.truncate()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in fields})
+            yield out.getvalue().encode("utf-8")
+
+    return StreamingResponse(
+        content(), media_type="text/csv" if format == "csv" else "application/json",
+        headers={"Content-Disposition": f'attachment; filename="aix5-events.{format}"'},
     )
 
 
@@ -1114,7 +1281,7 @@ def public_settings(request: Request | None = None):
     return settings
 
 
-def _public_event_rows(rows, request: Request):
+def _public_event_rows(rows, request: Request, *, base=None, token=None):
     """Rebuild screenshot origins from the current public address.
 
     Older event payloads may contain an origin captured before a DHCP change.
@@ -1122,13 +1289,14 @@ def _public_event_rows(rows, request: Request):
     current client.
     """
 
-    base = _sync_request_public_base(request)
+    base = base if base is not None else _sync_request_public_base(request)
+    token = token if token is not None else store.get("ha_token")
     result = []
     for row in rows:
         item = dict(row)
         if item.get("id"):
             item["screenshot_url"] = (
-                f"{base}/api/events/{item['id']}/image?token={store.get('ha_token')}"
+                f"{base}/api/events/{item['id']}/image?token={token}"
             )
         result.append(item)
     return result

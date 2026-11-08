@@ -448,7 +448,7 @@ async def inference_loop(cid):
                     # Hardware capture already provides NV12. Submit it
                     # directly to the TROS Image subscriber; this avoids the
                     # CPU JPEG encode/decode path entirely.
-                    result = await bridge.infer_nv12(native, cid)
+                    result = await bridge.infer_nv12(native, cid, camera.get("_native_fd"))
                 else:
                     result = await bridge.infer(bgr, cid, None)
             else:

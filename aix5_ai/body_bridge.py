@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import json
 import os
 import re
@@ -35,6 +36,48 @@ BODY_RESULT_TIMEOUT = float(os.getenv("AIX5_BODY_RESULT_TIMEOUT", "10"))
 _BODY_PREPROCESS_EXECUTOR = ThreadPoolExecutor(
     max_workers=4, thread_name_prefix="aix5-body-preprocess"
 )
+
+
+class _HardwareNv12Scaler:
+    """One independent RDK VPS channel for one camera."""
+
+    def __init__(self, source_width: int, source_height: int, target_width: int = 960, target_height: int = 544):
+        library = os.getenv(
+            "AIX5_VPS_LIBRARY",
+            str(Path(__file__).resolve().parent.parent / "native/librdk_nv12_vps.so"),
+        )
+        self._lib = ctypes.CDLL(library)
+        self._lib.aix5_vps_open.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        self._lib.aix5_vps_open.restype = ctypes.c_void_p
+        self._lib.aix5_vps_scale.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        self._lib.aix5_vps_scale.restype = ctypes.c_int
+        self._lib.aix5_vps_close.argtypes = [ctypes.c_void_p]
+        self._lib.aix5_vps_close.restype = None
+        self.source_width, self.source_height = source_width, source_height
+        self.target_width, self.target_height = target_width, target_height
+        self.input_size = source_width * source_height * 3 // 2
+        self.output_size = target_width * target_height * 3 // 2
+        self.handle = self._lib.aix5_vps_open(source_width, source_height, target_width, target_height)
+        if not self.handle:
+            raise RuntimeError("RDK VPS 硬件缩放初始化失败")
+
+    def scale(self, nv12: np.ndarray) -> np.ndarray:
+        expected = (self.source_height * 3 // 2, self.source_width)
+        if nv12.ndim != 2 or nv12.shape != expected:
+            raise ValueError("人体检测 NV12 帧尺寸与 VPS 通道不匹配")
+        output = np.empty(self.output_size, dtype=np.uint8)
+        ret = self._lib.aix5_vps_scale(
+            self.handle, nv12.ctypes.data_as(ctypes.c_void_p), self.input_size,
+            output.ctypes.data_as(ctypes.c_void_p), self.output_size, 3000,
+        )
+        if ret != 0:
+            raise RuntimeError(f"RDK VPS 硬件缩放失败: {ret}")
+        return output.reshape((self.target_height * 3 // 2, self.target_width))
+
+    def close(self):
+        if self.handle:
+            self._lib.aix5_vps_close(self.handle)
+            self.handle = None
 
 
 def _body_message(message):
@@ -164,7 +207,7 @@ def _encode_packet(source_id: str, sequence: int, frame: bytes, encoding: int = 
     source = str(source_id).encode("utf-8")
     if not source or len(source) > 65535:
         raise ValueError("人体检测通道 ID 过长")
-    if encoding not in (0, 1, 2):
+    if encoding not in (0, 1, 2, 3, 4):
         raise ValueError("人体检测帧编码类型无效")
     return _PACKET_META.pack(len(source), int(sequence)) + source + bytes([encoding]) + frame
 
@@ -188,8 +231,9 @@ def worker_main(args):
     # worker from a shell which sources /opt/tros/humble/setup.bash.
     import rclpy
     from ai_msgs.msg import PerceptionTargets
+    from hbm_img_msgs.msg import HbmMsg1080P
     from rclpy.node import Node
-    from sensor_msgs.msg import Image
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
     safe_id = re.sub(r"[^A-Za-z0-9_]", "_", args.camera_id)
     topic_root = "/aix5/body/" + safe_id
@@ -198,8 +242,8 @@ def worker_main(args):
         [
             "ros2", "run", "mono2d_body_detection", "mono2d_body_detection",
             "--ros-args", "-r", f"__node:=aix5_body_{safe_id}",
-            "-p", "is_shared_mem_sub:=0", "-p", f"model_file_name:={args.model}",
-            "-p", f"ros_img_topic_name:={image_topic}",
+            "-p", "is_shared_mem_sub:=1", "-p", f"model_file_name:={args.model}",
+            "-p", f"sharedmem_img_topic_name:={image_topic}",
             "-p", f"ai_msg_pub_topic_name:={output_topic}",
             # A shared detector must not carry MOT state from one camera into
             # another. Track IDs are assigned by PerCameraTracker below.
@@ -222,15 +266,27 @@ def worker_main(args):
     class BridgeNode(Node):
         def __init__(self):
             super().__init__("aix5_body_bridge_" + safe_id)
-            self.publisher = self.create_publisher(Image, image_topic, 10)
+            self.publisher = self.create_publisher(
+                HbmMsg1080P,
+                image_topic,
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST),
+            )
             self.connection = None
             self.send_lock = threading.Lock()
+            self.index_to_frame = {}
+            self.next_index = 1
             self.create_subscription(PerceptionTargets, output_topic, self.on_result, 10)
 
         def on_result(self, message):
             if self.connection is None:
                 return
-            payload = json.dumps(_body_message(message), separators=(",", ":")).encode()
+            result = _body_message(message)
+            try:
+                wire_index = int(result.get("frame_id", ""))
+                result["frame_id"] = self.index_to_frame.pop(wire_index, result["frame_id"])
+            except (TypeError, ValueError):
+                pass
+            payload = json.dumps(result, separators=(",", ":")).encode()
             try:
                 debug(f"result frame={message.header.frame_id} targets={len(message.targets)}")
                 with self.send_lock:
@@ -275,7 +331,7 @@ def worker_main(args):
         # allocator/serialization stall in the TROS subscriber. Reusing the
         # object follows the official publisher pattern and keeps the stream
         # at the detector's normal throughput.
-        message = Image()
+        message = HbmMsg1080P()
 
         def recv_exact(size):
             data = bytearray()
@@ -328,23 +384,23 @@ def worker_main(args):
                 image_height, image_width, image_step = image.shape[0], image.shape[1], image.shape[1] * 3 if image is not None else 0
             if image is None:
                 continue
-            debug(f"input seq={sequence} shape={image.shape}")
-            message.header.frame_id = _frame_id(source_id, sequence)
-            message.header.stamp = node.get_clock().now().to_msg()
+            frame_id = _frame_id(source_id, sequence)
+            wire_index = node.next_index
+            node.next_index = 1 if wire_index >= 2_000_000_000 else wire_index + 1
+            node.index_to_frame[wire_index] = frame_id
+            if len(node.index_to_frame) > 256:
+                node.index_to_frame.pop(next(iter(node.index_to_frame)))
+            debug(f"input frame={frame_id} index={wire_index} shape={image.shape}")
+            message.index = wire_index
+            stamp = node.get_clock().now().to_msg()
+            message.time_stamp = stamp
             message.height, message.width = image_height, image_width
-            message.encoding = image_encoding
-            message.is_bigendian = 0
+            encoded = (image_encoding + "\0").encode("ascii")[:12]
+            message.encoding[:] = array("B", encoded.ljust(12, b"\0"))
             message.step = image_step
             raw = image.tobytes()
-            # sensor_msgs/Image.data is an array('B') on the RDK Python
-            # bindings. Replacing it with a new bytes object for every 6 MB
-            # 1080p frame makes publish() block for seconds. Mutate the
-            # existing sequence in place so the ROS serializer can reuse its
-            # allocation while still accepting a new decoded frame.
-            if len(message.data) != len(raw):
-                message.data = array("B", raw)
-            else:
-                message.data[:] = array("B", raw)
+            message.data_size = len(raw)
+            message.data[: len(raw)] = array("B", raw)
             node.publisher.publish(message)
     finally:
         if connection is not None:
@@ -381,16 +437,25 @@ class BodyInferenceBridge:
         self._waiters = {}
         self._pending = {}
         self._trackers = {}
+        self._scalers = {}
         self._closed = False
 
     async def start(self):
-        script = str(Path(__file__).resolve())
+        native = str(Path(__file__).resolve().parent.parent / "native/rdk_body_bridge")
         command = (
+            "export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; "
+            "export FASTRTPS_DEFAULT_PROFILES_FILE=/opt/tros/humble/lib/hobot_shm/config/shm_fastdds.xml; "
+            "export RMW_FASTRTPS_USE_QOS_FROM_XML=1; "
+            "export ROS_DISABLE_LOANED_MESSAGES=0; "
             "source /opt/tros/humble/setup.bash; "
-            f"exec /usr/bin/python3 {__import__('shlex').quote(script)} --worker "
-            f"--camera-id {__import__('shlex').quote(self.camera_id)} "
-            f"--model {__import__('shlex').quote(self.model)} "
-            f"2>/tmp/aix5-body-bridge-{__import__('re').sub(r'[^A-Za-z0-9_]', '_', self.camera_id)}.log"
+            f"ros2 run mono2d_body_detection mono2d_body_detection "
+            f"--ros-args -r __node:=aix5_body_shared -p is_shared_mem_sub:=1 "
+            f"-p sharedmem_img_topic_name:=/aix5/body/shared/image "
+            f"-p model_file_name:={__import__('shlex').quote(self.model)} "
+            f"-p ai_msg_pub_topic_name:=/aix5/body/shared/out -p track_mode:=0 -p model_type:=0 "
+            f">/tmp/aix5-body-detector.log 2>&1 & detector=$!; "
+            f"trap 'kill $detector 2>/dev/null || true' EXIT; "
+            f"{__import__('shlex').quote(native)} 2>/home/emouse/data/native-body.log; rc=$?; exit $rc"
         )
         try:
             self.process = await asyncio.create_subprocess_exec(
@@ -499,7 +564,7 @@ class BodyInferenceBridge:
         tracker.assign(result.get("detections", []))
         return result
 
-    async def infer_nv12(self, nv12: np.ndarray, source_id: str) -> dict:
+    async def infer_nv12(self, nv12: np.ndarray, source_id: str, native_fd: int | None = None) -> dict:
         """Submit the camera's hardware-decoded NV12 frame directly to TROS."""
 
         if nv12.ndim != 2 or nv12.shape[0] % 3 != 0:
@@ -512,16 +577,17 @@ class BodyInferenceBridge:
         frame_id = _frame_id(source_id, sequence)
         source_height = height
         source_width = width
-        prepared = nv12
+        loop = asyncio.get_running_loop()
+        # The native bridge reads this camera's latest capture ring directly;
+        # Python sends only a control packet and never copies the NV12 payload.
+        prepared = b""
         preprocess_ms = 0.0
         target_height = source_height
         target_width = source_width
-        payload = _encode_packet(
-            source_id,
-            sequence,
-            struct.pack("!II", target_width, target_height) + prepared.tobytes(),
-            encoding=2,
-        )
+        if native_fd is not None:
+            payload = _encode_packet(source_id, sequence, struct.pack("!II", os.getpid(), native_fd), encoding=4)
+        else:
+            payload = _encode_packet(source_id, sequence, prepared, encoding=3)
         waiter = loop.create_future()
         self._waiters[frame_id] = waiter
         send_started = time.monotonic()
@@ -557,6 +623,9 @@ class BodyInferenceBridge:
         self._waiters.clear()
         self._pending.clear()
         self._trackers.clear()
+        for scaler in self._scalers.values():
+            scaler.close()
+        self._scalers.clear()
         if self.writer is not None:
             self.writer.close()
             await self.writer.wait_closed()

@@ -67,6 +67,7 @@ class Store:
             "preview_resolution" not in settings
             or "allow_software_fallback" not in settings
             or "timezone" not in settings
+            or "remote_access" not in settings
         ):
             self.set("settings", {**DEFAULT_SETTINGS, **settings})
         # Preserve all existing credentials, including older installations.
@@ -278,6 +279,28 @@ class Store:
                 self.get("username"), self.get("password_hash"), password
             ),
         )
+
+    @synchronized
+    def set_ddns_credential(self, credential):
+        if credential is None:
+            with self.db:
+                self.db.execute("DELETE FROM kv WHERE key='ddns_credential'")
+            return
+        payload = json.dumps(credential, ensure_ascii=False) if isinstance(credential, dict) else json.dumps({"legacy": credential})
+        encrypted = self._onvif_cipher(create=True).encrypt(payload.encode("utf-8")).decode("ascii")
+        self.set("ddns_credential", encrypted)
+
+    @synchronized
+    def ddns_credential(self):
+        encrypted = self.get("ddns_credential")
+        if not encrypted:
+            return None
+        try:
+            payload = self._onvif_cipher().decrypt(encrypted.encode("ascii")).decode("utf-8")
+            parsed = json.loads(payload)
+            return parsed.get("legacy") if isinstance(parsed, dict) and "legacy" in parsed else parsed
+        except (OSError, InvalidToken, ValueError, UnicodeDecodeError):
+            return None
 
     @synchronized
     def onvif_password(self):

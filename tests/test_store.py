@@ -58,6 +58,18 @@ def test_password_change_invalidates_all_sessions_and_removes_initial_file(
     assert not (tmp_path / "initial-admin.txt").exists()
 
 
+def test_ddns_credential_is_encrypted_and_survives_restart(store, tmp_path):
+    store.set_ddns_credential("cloudflare-secret")
+    assert store.ddns_credential() == "cloudflare-secret"
+    assert "cloudflare-secret" not in (tmp_path / "app.db").read_bytes().decode("utf-8", "ignore")
+    store.close()
+    reopened = Store(tmp_path / "app.db")
+    try:
+        assert reopened.ddns_credential() == "cloudflare-secret"
+    finally:
+        reopened.close()
+
+
 def event(tmp_path, eid, target="person", created=None):
     return {
         "id": eid,

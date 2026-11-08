@@ -82,6 +82,9 @@ COCO_LABELS = [
     "hair drier",
     "toothbrush",
 ]
+
+BODY_LABELS = ["body", "head", "face", "hand"]
+BODY_LABELS_ZH = {"body": "人体", "head": "人头", "face": "人脸", "hand": "人手"}
 COCO_LABELS_ZH = {
     "person": "人",
     "bicycle": "自行车",

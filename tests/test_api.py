@@ -784,6 +784,28 @@ async def test_software_fallback_policy_is_explicit_and_defaults_off(client):
     assert (await client.get("/api/audio/status")).status_code == 200
 
 
+async def test_network_status_and_remote_access_configuration(client):
+    await login(client)
+    network = await client.get("/api/network/status")
+    assert network.status_code == 200
+    assert {"interfaces", "ipv4", "ipv6"} <= network.json().keys()
+    settings = (await client.get("/api/settings")).json()
+    assert settings["remote_access"]["enabled"] is False
+    assert settings["remote_access"]["credential_configured"] is False
+    assert "credential" not in settings["remote_access"]
+    assert (await client.patch("/api/remote-access", json={"enabled": True, "hostname": "camera.example.com"})).status_code == 422
+    saved = await client.patch(
+        "/api/remote-access",
+        json={"enabled": False, "provider": "cloudflare", "hostname": "camera.example.com", "credential": "test-token"},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["credential_configured"] is True
+    assert saved.json()["hostname"] == "camera.example.com"
+    assert "test-token" not in saved.text
+    remote = await client.get("/api/remote-access")
+    assert remote.json()["credential_configured"] is True
+
+
 async def test_rule_options_use_camera_model_defaults_and_enabled_targets(client, monkeypatch):
     assert (await client.get("/api/rules")).status_code == 401
     assert (await client.get("/api/cameras/unknown/rule-options")).status_code == 401

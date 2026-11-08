@@ -68,10 +68,11 @@ bash deploy/install-mediamtx.sh
 
 | 模型 | 默认位置 |
 |---|---|
-| YOLO11n | `/app/pydev_demo/02_detection_sample/02_ultralytics_yolo11/yolo11n_detect_bayese_640x640_nv12.bin` |
-| YOLO11m | `/opt/hobot/model/x5/basic/yolo11m_detect_bayese_640x640_nv12_modified.bin` |
+| mono2d body | `/opt/tros/humble/lib/mono2d_body_detection/config/multitask_body_head_face_hand_kps_960x544.hbm` |
 
-YOLO11n 可通过 `AIX5_MODEL_PATH` 指定另一份兼容模型。模型必须与输入尺寸、量化输出和本项目后处理对应；仅替换文件名不能自动适配其他模型。仓库不包含模型权重或 RDK SDK。
+当前室内安防使用 TROS `mono2d_body_detection`。官方节点输出人体、人头、人脸、人手框、17 点人体关键点和 MOT 跟踪 ID；AIX5 通过本地桥接把结果转换为预览、规则和事件截图使用的统一检测结构。开发板需要安装 `/opt/tros/humble`、`mono2d_body_detection` 节点和对应 HBM 模型。仓库不包含模型权重或 RDK SDK。
+
+预览画面会分别渲染四类人体相关框；人体框叠加 17 点关键点骨架和跟踪 ID。事件截图按当前规则的目标类别保留对应框，规则与 AI 显示均不再暴露 COCO 其他类别。
 
 ## 4. 首次运行
 
@@ -174,6 +175,8 @@ ONVIF 服务路径包括 `device_service`、`media_service`、`analytics_service
 | `AIX5_ENCODER_LIB` | `native/librdk_h264_encoder.so` |
 | `AIX5_MEDIAMTX_BIN` | `native/mediamtx` |
 | `AIX5_MODEL_PATH` | 默认 YOLO11n 模型路径 |
+
+系统设置中的“当前网络地址”会列出运行网卡上的 IPv4 和 IPv6 地址。远程访问设置按 ddns-go 的 provider 目录展示阿里云、腾讯云、华为云、百度云、Cloudflare、DNSPod、GoDaddy、Vercel、CloudNS、deSEC 等服务商；当前实际接入 Cloudflare API Token、DNSPod `Token ID,Token`、阿里云 `AccessKey ID,AccessKey Secret`、腾讯云 `SecretId,SecretKey`、百度云 Access Key/Secret Key 和华为云 Access Key/Secret Key。Access Key ID 和 Secret 分开填写，IPv4/IPv6 分别选择上报地址。DDNS 固定每 5 分钟检查一次，每种记录只在地址不同于上次成功上报值时提交 DNS 写入；地址未变化时不调用 provider 的写入接口。凭据加密保存在数据目录 `.onvif-secret.key` 对应的 Fernet 密文中；备份和恢复时必须同时保留数据库与该密钥。启用 DDNS 后，应用启动时和按设置的周期执行更新，页面也提供手动更新入口。更新需要开发板能够访问 DNS 服务商 API，公网 IPv4 / IPv6 不可用时会在页面状态中报告失败原因。
 
 安装器生成的 unit 显式设置自身支持的路径和地址变量；其他模型或运行时变量需要写入 systemd override 才会传给服务。例如：
 

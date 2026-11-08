@@ -2,7 +2,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, Field, field_validator, model_validator
-from .labels import COCO_LABELS
+from .labels import BODY_LABELS, COCO_LABELS
 from .config import DEFAULT_DETECTION_CONFIDENCE, DEFAULT_SETTINGS
 
 
@@ -10,7 +10,7 @@ def validate_labels(values):
     labels = [x.strip().lower() for x in values if x.strip()]
     if not labels or len(labels) != len(set(labels)):
         raise ValueError("至少选择一个不重复的检测类别")
-    if any(label not in COCO_LABELS for label in labels):
+    if any(label not in COCO_LABELS and label not in BODY_LABELS for label in labels):
         raise ValueError("包含不支持的检测类别")
     return labels
 
@@ -51,7 +51,7 @@ class CameraConfig(BaseModel):
     rtsp_url: str = Field(min_length=1, max_length=2048)
     transport: Literal["tcp", "udp"] = "tcp"
     enabled: bool = True
-    model_id: Literal["yolo11n", "yolo11m"] = "yolo11n"
+    model_id: Literal["body", "yolo11n", "yolo11m"] = "yolo11n"
     analysis_fps: float = Field(default=5, ge=1, le=10)
     preview_fps: float = Field(default=5, ge=1, le=10)
     enabled_labels: list[str] = Field(
@@ -105,7 +105,7 @@ class CameraPatch(BaseModel):
     rtsp_url: str | None = None
     transport: Literal["tcp", "udp"] | None = None
     enabled: bool | None = None
-    model_id: Literal["yolo11n", "yolo11m"] | None = None
+    model_id: Literal["body", "yolo11n", "yolo11m"] | None = None
     analysis_fps: float | None = None
     preview_fps: float | None = None
     enabled_labels: list[str] | None = None
@@ -176,6 +176,35 @@ class RulePatch(BaseModel):
         return self
 
 
+class RemoteAccessConfig(BaseModel):
+    """Non-secret DDNS settings; the provider credential lives in the keyring."""
+
+    enabled: bool = False
+    provider: Literal["cloudflare", "dnspod", "alidns", "tencentcloud", "baiducloud", "huaweicloud"] = "cloudflare"
+    hostname: str = Field(default="", max_length=253)
+    ipv4: bool = True
+    ipv6: bool = True
+    ipv4_address: str = Field(default="", max_length=64)
+    ipv6_address: str = Field(default="", max_length=128)
+    interval_seconds: Literal[300] = 300
+
+    @field_validator("hostname")
+    @classmethod
+    def valid_hostname(cls, value):
+        value = value.strip().rstrip(".").lower()
+        if value:
+            from .ddns import validate_hostname
+
+            return validate_hostname(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_enabled(self):
+        if self.enabled and (not self.hostname or not (self.ipv4 or self.ipv6)):
+            raise ValueError("启用远程访问时必须填写域名并至少选择一种地址类型")
+        return self
+
+
 class SettingsConfig(BaseModel):
     timezone: str = Field(default=DEFAULT_SETTINGS["timezone"], min_length=1, max_length=64)
     allow_software_fallback: bool = False
@@ -183,6 +212,7 @@ class SettingsConfig(BaseModel):
     retention_days: Literal[3, 7, 30] = 7
     max_event_storage_mb: int = Field(default=2048, ge=16, le=8192)
     base_url: str = Field(max_length=255)
+    remote_access: RemoteAccessConfig = Field(default_factory=RemoteAccessConfig)
 
     @field_validator("timezone")
     @classmethod
@@ -220,6 +250,24 @@ class SettingsPatch(BaseModel):
     def no_null_fields(self):
         if any(getattr(self, key) is None for key in self.model_fields_set):
             raise ValueError("配置字段不能为 null")
+        return self
+
+
+class RemoteAccessPatch(BaseModel):
+    enabled: bool | None = None
+    provider: Literal["cloudflare", "dnspod", "alidns", "tencentcloud", "baiducloud", "huaweicloud"] | None = None
+    hostname: str | None = Field(default=None, max_length=253)
+    ipv4: bool | None = None
+    ipv6: bool | None = None
+    interval_seconds: Literal[300] | None = None
+    credential: str | None = Field(default=None, max_length=2048)
+    ipv4_address: str | None = Field(default=None, max_length=64)
+    ipv6_address: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def no_null_fields(self):
+        if any(getattr(self, key) is None for key in self.model_fields_set if key != "credential"):
+            raise ValueError("远程访问字段不能为 null")
         return self
 
 

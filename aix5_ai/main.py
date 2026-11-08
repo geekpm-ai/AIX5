@@ -3,6 +3,7 @@ import asyncio, datetime, logging, os, time, uuid, csv, io, json, re
 import ipaddress
 import base64
 import math
+import cv2
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -25,6 +26,9 @@ from .config import CAPTURE_BIN, EVENTS, HOST, PORT, MODELS, DEFAULT_SETTINGS, m
 from . import codec_tuning
 from .hw_capture import manager
 from .event_images import make_event_snapshot
+from .ddns import DdnsClient, DDNS_PROVIDER_CATALOG, SUPPORTED_PROVIDERS
+from .network import snapshot as network_snapshot
+from .body_bridge import BodyInferenceBridge, BODY_MODEL
 from .inference import (
     get_detector,
     hbm_runtime,
@@ -33,7 +37,7 @@ from .inference import (
 )
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
-from .labels import COCO_GROUPS, COCO_LABELS, COCO_LABELS_ZH, DEFAULT_ENABLED_LABELS
+from .labels import BODY_LABELS, BODY_LABELS_ZH, COCO_GROUPS, COCO_LABELS, COCO_LABELS_ZH, DEFAULT_ENABLED_LABELS
 from .metrics import metrics
 from .onvif import discover, probe
 from .onvif_auth import authenticate as authenticate_onvif, OnvifAuthError
@@ -59,6 +63,8 @@ from .schemas import (
     RulePatch,
     SettingsConfig,
     SettingsPatch,
+    RemoteAccessConfig,
+    RemoteAccessPatch,
 )
 from pydantic import ValidationError
 from .store import Store
@@ -95,6 +101,15 @@ auth_lock = asyncio.Lock()
 settings_lock = asyncio.Lock()
 onvif_events = OnvifEventHub()
 rtsp_output = None
+body_bridges = {}
+ddns_status = {
+    "state": "disabled",
+    "last_update": None,
+    "last_error": None,
+    "addresses": {"ipv4": None, "ipv6": None},
+    "changed": [],
+    "unchanged": [],
+}
 
 
 async def auth(session: str | None = Cookie(default=None, alias="aix5_session")):
@@ -155,6 +170,9 @@ def camera_view(c):
             "last_inference_at",
             "detection_count",
             "inference_latency_ms",
+            "inference_preprocess_ms",
+            "inference_send_ms",
+            "inference_wait_ms",
             "inference_error",
             "model_id",
             "analysis_fps",
@@ -296,6 +314,98 @@ async def refresh_rtsp_credentials():
         await rtsp_output.configure(store.get("username"), password)
 
 
+def _remote_access_config() -> dict:
+    settings = store.get("settings", {}) if store else {}
+    raw = dict(settings.get("remote_access", {}))
+    # DDNS is deliberately a five-minute check. Keep older saved intervals
+    # readable, but normalize them before validation and scheduling.
+    raw["interval_seconds"] = 300
+    return RemoteAccessConfig.model_validate(raw).model_dump()
+
+
+def remote_access_public() -> dict:
+    config = _remote_access_config()
+    return {
+        **config,
+        "credential_configured": bool(store and store.ddns_credential()),
+        "providers": DDNS_PROVIDER_CATALOG,
+        "supported_providers": list(SUPPORTED_PROVIDERS),
+        "status": dict(ddns_status),
+    }
+
+
+async def ddns_update_once():
+    """Run one DDNS update and retain a redacted status for the settings page."""
+
+    config = _remote_access_config()
+    if not config["enabled"]:
+        ddns_status.update(state="disabled", last_error=None, changed=[], unchanged=[])
+        return remote_access_public()
+    credential = await run_worker(store.ddns_credential)
+    if not credential:
+        ddns_status.update(state="error", last_error="未配置 DNS 凭据", changed=[], unchanged=[])
+        return remote_access_public()
+    last_key = f"{config['provider']}|{config['hostname']}"
+    saved_last = await run_worker(store.get, "ddns_last_addresses", {})
+    previous = saved_last.get(last_key, {}) if isinstance(saved_last, dict) else {}
+    ddns_status.update(state="updating", last_error=None)
+    try:
+        result = await DdnsClient().update(config, credential, previous=previous)
+        if result.changed:
+            updated = dict(previous)
+            for record_type in result.changed:
+                updated[record_type.lower()] = result.addresses.get(record_type.lower())
+            saved_last[last_key] = updated
+            await run_worker(store.set, "ddns_last_addresses", saved_last)
+        ddns_status.update(
+            state="ok",
+            last_update=time.time(),
+            last_error=None,
+            addresses=result.addresses,
+            changed=result.changed,
+            unchanged=result.unchanged,
+        )
+    except Exception as exc:
+        ddns_status.update(state="error", last_error=str(exc), changed=[], unchanged=[])
+        log.warning("DDNS 更新失败: %s", exc)
+    return remote_access_public()
+
+
+async def ddns_loop():
+    while True:
+        await ddns_update_once()
+        await asyncio.sleep(300)
+
+
+async def restart_ddns_task():
+    task = tasks.pop("_ddns", None)
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    config = _remote_access_config()
+    if config["enabled"] and store.ddns_credential():
+        tasks["_ddns"] = asyncio.create_task(ddns_loop())
+
+
+async def ensure_body_bridge(cid: str):
+    camera = manager.cameras.get(cid)
+    shared = body_bridges.get("_shared")
+    if camera is None or camera.get("model_id") != "body" or not camera.get("enabled", True):
+        body_bridges.pop(cid, None)
+        if shared is not None and not any(
+            item.get("model_id") == "body" and item.get("enabled", True)
+            for item in manager.cameras.values()
+        ):
+            body_bridges.pop("_shared", None)
+            await shared.close()
+        return
+    if shared is None:
+        shared = BodyInferenceBridge("shared", BODY_MODEL)
+        await shared.start()
+        body_bridges["_shared"] = shared
+    body_bridges[cid] = shared
+
+
 async def inference_loop(cid):
     camera = manager.cameras[cid]
     queue = manager.frame_queues[cid]
@@ -314,33 +424,52 @@ async def inference_loop(cid):
             await asyncio.sleep(delay)
         model_id = camera.get("model_id", "yolo11n")
         try:
-            async with inference_sem:
-                # Consume the freshest frame after waiting for the shared BPU.
-                while not queue.empty():
-                    bgr, jpg, generation = queue.get_nowait()
-                if (
-                    generation != manager.generations.get(cid)
-                    or camera.get("status") != "running"
-                ):
-                    continue
-                last_infer = time.monotonic()
-                if inference_executor is None:
-                    result = await run_worker(lambda: get_detector(model_id).infer(bgr))
+            # Consume the freshest frame after waiting for the shared BPU.
+            while not queue.empty():
+                bgr, jpg, generation = queue.get_nowait()
+            if (
+                generation != manager.generations.get(cid)
+                or camera.get("status") != "running"
+            ):
+                continue
+            last_infer = time.monotonic()
+            if model_id == "body":
+                # The official detector is one shared TROS node. Its bridge
+                # has bounded per-camera in-flight requests, so body frames
+                # must be allowed to overlap while the single ROS/BPU
+                # pipeline drains them. Serializing this await behind the
+                # legacy YOLO semaphore would cap four 5 FPS cameras at one
+                # request every ~160 ms.
+                bridge = body_bridges.get(cid)
+                if bridge is None:
+                    raise RuntimeError("人体检测桥接进程未启动")
+                native = manager.native_images.get(cid)
+                if native is not None:
+                    # Hardware capture already provides NV12. Submit it
+                    # directly to the TROS Image subscriber; this avoids the
+                    # CPU JPEG encode/decode path entirely.
+                    result = await bridge.infer_nv12(native, cid)
                 else:
-                    prepared = await run_worker(prepare_inference_process, bgr)
-                    future = asyncio.get_running_loop().run_in_executor(
-                        inference_executor,
-                        infer_in_process,
-                        model_id,
-                        prepared,
-                        bgr.shape[1],
-                        bgr.shape[0],
-                    )
-                    try:
-                        result = await asyncio.shield(future)
-                    except asyncio.CancelledError:
-                        await asyncio.gather(future, return_exceptions=True)
-                        raise
+                    result = await bridge.infer(bgr, cid, None)
+            else:
+                async with inference_sem:
+                    if inference_executor is None:
+                        result = await run_worker(lambda: get_detector(model_id).infer(bgr))
+                    else:
+                        prepared = await run_worker(prepare_inference_process, bgr)
+                        future = asyncio.get_running_loop().run_in_executor(
+                            inference_executor,
+                            infer_in_process,
+                            model_id,
+                            prepared,
+                            bgr.shape[1],
+                            bgr.shape[0],
+                        )
+                        try:
+                            result = await asyncio.shield(future)
+                        except asyncio.CancelledError:
+                            await asyncio.gather(future, return_exceptions=True)
+                            raise
             if (
                 generation != manager.generations.get(cid)
                 or model_id != camera.get("model_id", "yolo11n")
@@ -348,25 +477,31 @@ async def inference_loop(cid):
                 or camera.get("status") != "running"
             ):
                 continue
-            enabled = set(camera.get("enabled_labels", DEFAULT_ENABLED_LABELS))
+            enabled = set(BODY_LABELS) if model_id == "body" else set(camera.get("enabled_labels", DEFAULT_ENABLED_LABELS))
             detections = []
             for detection in result.get("detections", []):
-                class_id = detection["class_id"]
-                label = (
-                    COCO_LABELS[class_id]
-                    if 0 <= class_id < len(COCO_LABELS)
-                    else f"class_{class_id}"
-                )
+                if model_id == "body":
+                    label = detection.get("label", "body")
+                else:
+                    class_id = detection["class_id"]
+                    label = (
+                        COCO_LABELS[class_id]
+                        if 0 <= class_id < len(COCO_LABELS)
+                        else f"class_{class_id}"
+                    )
                 if label in enabled:
                     detections.append(
                         {
                             **detection,
                             "label": label,
-                            "label_zh": COCO_LABELS_ZH.get(label, label),
+                            "label_zh": BODY_LABELS_ZH.get(label, label) if model_id == "body" else COCO_LABELS_ZH.get(label, label),
                         }
                     )
             result["detections"] = detections
-            height, width = bgr.shape[:2]
+            if model_id == "body" and getattr(bgr, "ndim", 0) == 2:
+                height, width = bgr.shape[0] * 2 // 3, bgr.shape[1]
+            else:
+                height, width = bgr.shape[:2]
             camera.update(
                 last_inference=result,
                 inference_error=None,
@@ -375,6 +510,9 @@ async def inference_loop(cid):
                     datetime.timezone.utc
                 ).isoformat(),
                 inference_latency_ms=result.get("latency_ms"),
+                inference_preprocess_ms=result.get("preprocess_ms"),
+                inference_send_ms=result.get("send_ms"),
+                inference_wait_ms=result.get("wait_ms"),
                 detection_count=len(detections),
                 detection_payload={
                     "camera_id": cid,
@@ -424,7 +562,12 @@ async def inference_loop(cid):
                     detections, evaluated_rules[event["rule_id"]],
                     event["target_type"], (width, height),
                 )
-                image = await run_worker(make_event_snapshot, bgr, boxes)
+                snapshot_frame = bgr
+                if model_id == "body" and getattr(bgr, "ndim", 0) == 2:
+                    snapshot_frame = await run_worker(
+                        cv2.cvtColor, bgr, cv2.COLOR_YUV2BGR_NV12
+                    )
+                image = await run_worker(make_event_snapshot, snapshot_frame, boxes)
                 if not image:
                     raise RuntimeError("事件截图编码失败")
                 if generation != manager.generations.get(cid) or not rule_event_is_current(event):
@@ -486,10 +629,22 @@ async def startup():
     manager.allow_software_fallback = settings.get("allow_software_fallback", False)
     codec_tuning.allow_software_fallback = manager.allow_software_fallback
     for camera in store.cameras():
+        # Existing enabled cameras are moved to the official body/MOT model.
+        # Disabled legacy cameras remain editable until they are enabled.
+        if camera.get("enabled", True) and camera.get("model_id") != "body":
+            camera["model_id"] = "body"
+            camera["enabled_labels"] = list(BODY_LABELS)
+            store.save_camera(camera)
+            for rule in store.rules(camera["id"]):
+                if rule.get("target_labels") != ["body"]:
+                    rule["target_labels"] = ["body"]
+                    store.save_rule(rule)
         # Validate persisted config and discard legacy runtime fields.
         config = CameraConfig.model_validate(camera).model_dump()
         camera = {**camera, **config, "status": "disconnected", "last_error": None}
         await manager.add(camera)
+        if camera.get("model_id") == "body":
+            await ensure_body_bridge(camera["id"])
     refresh_discovery()
     # Populate all rule identities before an inference task can emit its first
     # formal trigger, including while another camera is still starting.
@@ -499,6 +654,7 @@ async def startup():
     await rtsp_output.start()
     await onvif_gateway.start_discovery()
     tasks["_retention"] = asyncio.create_task(retention_loop())
+    await restart_ddns_task()
 
 
 async def retention_loop():
@@ -523,6 +679,9 @@ async def shutdown():
     if rtsp_output is not None:
         await rtsp_output.stop()
     await close_peers()
+    for bridge in set(body_bridges.values()):
+        await bridge.close()
+    body_bridges.clear()
     for task in tasks.values():
         task.cancel()
     await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -720,6 +879,8 @@ async def update_camera(cid: str, req: CameraPatch, _: bool = Depends(auth)):
             ).model_dump()
         except ValidationError as exc:
             raise HTTPException(422, exc.errors(include_context=False))
+        if config.get("model_id") == "body":
+            config["enabled_labels"] = list(BODY_LABELS)
         restart = any(
             camera.get(k) != config[k] for k in ("rtsp_url", "transport", "enabled")
         )
@@ -728,6 +889,8 @@ async def update_camera(cid: str, req: CameraPatch, _: bool = Depends(auth)):
         )
         camera.update(config)
         store.save_camera(camera)
+        if changed or camera.get("model_id") == "body":
+            await ensure_body_bridge(cid)
         if restart:
             await manager.workers[cid].reconnect()
             await manager.reconfigure_audio(cid)
@@ -772,6 +935,8 @@ async def delete_camera(cid: str, _: bool = Depends(auth)):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await manager.remove(cid)
+        body_bridges.pop(cid, None)
+        await ensure_body_bridge(cid)
         await close_peers(cid)
         engine.reset_camera(cid)
         store.delete_camera(cid)
@@ -893,19 +1058,10 @@ async def models(_: bool = Depends(auth)):
 
 @app.get("/api/detection-labels")
 async def detection_labels(_: bool = Depends(auth)):
-    groups = {
-        label: group
-        for group, labels_in_group in COCO_GROUPS.items()
-        for label in labels_in_group
-    }
-    return [
-        {
-            "id": label,
-            "name": COCO_LABELS_ZH.get(label, label),
-            "group": groups.get(label, "其他目标"),
-        }
-        for label in COCO_LABELS
-    ]
+    # The deployed indoor-security model exposes the body class only. Keep the
+    # endpoint narrow so both AI display and rule editing cannot select COCO
+    # objects that the active model never produces.
+    return [{"id": label, "name": BODY_LABELS_ZH[label], "group": "人体"} for label in BODY_LABELS]
 
 
 @app.get("/api/cameras/{cid}/rules")
@@ -930,9 +1086,9 @@ async def get_rule_options(cid: str, _: bool = Depends(auth)):
     model_id = camera.get("model_id", "yolo11n")
     model = MODELS[model_id]
     threshold = model_confidence_threshold(model_id)
-    enabled = set(camera.get("enabled_labels", DEFAULT_ENABLED_LABELS))
+    enabled = set(BODY_LABELS) if model_id == "body" else set(camera.get("enabled_labels", DEFAULT_ENABLED_LABELS))
     labels = [
-        {"id": label, "name": COCO_LABELS_ZH.get(label, label)}
+        {"id": label, "name": BODY_LABELS_ZH.get(label, COCO_LABELS_ZH.get(label, label)) if model_id == "body" else COCO_LABELS_ZH.get(label, label)}
         for label in model["labels"] if label in enabled
     ]
     return {
@@ -961,18 +1117,20 @@ def validate_rule_threshold(camera, threshold, previous=None):
 async def add_rule(cid: str, req: RuleConfig, _: bool = Depends(auth)):
     if cid not in manager.cameras:
         raise HTTPException(404, "摄像头不存在")
-    invalid = [x for x in req.target_labels if x not in set(COCO_LABELS)]
+    target_labels = ["body"] if manager.cameras[cid].get("model_id") == "body" else req.target_labels
+    invalid = [x for x in target_labels if x not in set(COCO_LABELS)]
     if invalid:
         raise HTTPException(422, "不支持的目标类别：" + ", ".join(invalid))
     disabled = [
         x
-        for x in req.target_labels
+        for x in target_labels
         if x
         not in set(manager.cameras[cid].get("enabled_labels", DEFAULT_ENABLED_LABELS))
     ]
     if disabled:
         raise HTTPException(422, "类别未在该摄像头启用：" + ", ".join(disabled))
     r = req.model_dump()
+    r["target_labels"] = target_labels
     if "confidence_threshold" not in req.model_fields_set:
         r["confidence_threshold"] = model_confidence_threshold(manager.cameras[cid].get("model_id", "yolo11n"))
     validate_rule_threshold(manager.cameras[cid], r["confidence_threshold"])
@@ -1278,6 +1436,7 @@ def public_settings(request: Request | None = None):
     if request is not None:
         _sync_request_public_base(request)
     settings = {**DEFAULT_SETTINGS, **store.get("settings", {})}
+    settings["remote_access"] = remote_access_public()
     return settings
 
 
@@ -1305,6 +1464,57 @@ def _public_event_rows(rows, request: Request, *, base=None, token=None):
 @app.get("/api/settings")
 async def settings(request: Request, _: bool = Depends(auth)):
     return public_settings(request)
+
+
+@app.get("/api/network/status")
+async def network_status(_: bool = Depends(auth)):
+    return await run_worker(network_snapshot)
+
+
+@app.get("/api/remote-access")
+async def remote_access(_: bool = Depends(auth)):
+    return remote_access_public()
+
+
+@app.patch("/api/remote-access")
+async def patch_remote_access(req: RemoteAccessPatch, _: bool = Depends(auth)):
+    async with settings_lock:
+        old = _remote_access_config()
+        updates = req.model_dump(exclude_unset=True, exclude={"credential", "access_key_id", "access_key_secret"})
+        try:
+            config = RemoteAccessConfig.model_validate({**old, **updates})
+        except ValidationError as exc:
+            raise HTTPException(422, exc.errors(include_context=False))
+        current_credential = await run_worker(store.ddns_credential)
+        credential = req.credential if "credential" in req.model_fields_set else None
+        if "access_key_id" in req.model_fields_set or "access_key_secret" in req.model_fields_set:
+            current = current_credential if isinstance(current_credential, dict) else {}
+            credential = {
+                "access_key_id": req.access_key_id if req.access_key_id is not None and req.access_key_id != "" else current.get("access_key_id", ""),
+                "access_key_secret": req.access_key_secret if req.access_key_secret is not None and req.access_key_secret != "" else current.get("access_key_secret", ""),
+            }
+        if credential is not None:
+            if isinstance(credential, dict):
+                if not any(credential.values()):
+                    credential = None
+            else:
+                credential = credential.strip()
+            if credential:
+                await run_worker(store.set_ddns_credential, credential)
+            elif not config.enabled:
+                await run_worker(store.set_ddns_credential, None)
+        elif config.enabled and not current_credential:
+            raise HTTPException(422, "启用远程访问时必须填写 DNS 凭据")
+        settings = store.get("settings", {})
+        settings["remote_access"] = config.model_dump()
+        store.set("settings", settings)
+        await restart_ddns_task()
+    return remote_access_public()
+
+
+@app.post("/api/remote-access/update")
+async def update_remote_access(_: bool = Depends(auth)):
+    return await ddns_update_once()
 
 
 @app.patch("/api/settings")
@@ -1337,6 +1547,11 @@ async def patch_settings(req: SettingsPatch, _: bool = Depends(auth)):
 
 @app.get("/api/settings/export")
 async def export_settings(_: bool = Depends(auth)):
+    exported_settings = dict(store.get("settings") or {})
+    remote = dict(exported_settings.get("remote_access") or {})
+    for field in ("access_key_id", "access_key_secret"):
+        remote.pop(field, None)
+    exported_settings["remote_access"] = remote
     payload = {
         "cameras": [
             {
@@ -1350,7 +1565,7 @@ async def export_settings(_: bool = Depends(auth)):
             for c in store.cameras()
         ],
         "rules": store.rules(),
-        "settings": store.get("settings"),
+        "settings": exported_settings,
     }
     return Response(
         json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),

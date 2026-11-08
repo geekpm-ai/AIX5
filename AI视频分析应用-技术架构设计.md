@@ -336,6 +336,10 @@ TF 卡空间有限，不保存连续视频；事件截图采用 JPEG，并通过
 
 事件页面仅显示一个“导出”入口，默认下载 CSV；JSON 格式仍由 API 支持。点击事件缩略图通过原生 `dialog` 在当前页面展示大图，支持关闭按钮、遮罩点击及 Esc 关闭，并提供加载和截图失效状态。大图沿用已保存的事件 JPEG，不重新推理或修改标注。
 
+系统设置通过网络接口枚举当前网卡的 IPv4 / IPv6 地址，并区分局域网、链路本地和全局地址。远程访问配置参考 ddns-go 的 provider 模式，当前支持 Cloudflare 和 DNSPod，使用加密的 provider 凭据更新同一主机名的 A / AAAA 记录；周期 worker 与手动更新共用同一更新器，设置 API 只返回 `credential_configured` 和最近更新状态，不返回凭据明文。
+
+室内安防推理使用 TROS `mono2d_body_detection`。桥接结果统一为 `body`、`head`、`face`、`hand` 四类框；`body` 结果附带 17 点 `body_kps` 和 `track_id`。前端 Canvas 按跟踪 ID 选择颜色并绘制人体骨架，规则引擎按四类目标分别匹配，事件截图按对应规则保存目标框。
+
 ## 9. Web 应用与前端
 
 ### 9.1 技术栈

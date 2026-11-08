@@ -580,6 +580,16 @@ class HardwareManager:
     async def _analysis_worker(self, cid):
         while cid in self.analysis_latest and cid in self.cameras:
             camera, nv12, generation = self.analysis_latest.pop(cid)
+            if camera.get("model_id") == "body":
+                # The official body detector consumes NV12 directly. Keep the
+                # hardware-decoded frame in the analysis queue and avoid a
+                # CPU NV12->BGR conversion that would otherwise be discarded
+                # by the body bridge.
+                q = self.frame_queues[cid]
+                if q.full():
+                    q.get_nowait()
+                q.put_nowait((nv12, None, generation))
+                continue
             bgr = await asyncio.to_thread(cv2.cvtColor, nv12, cv2.COLOR_YUV2BGR_NV12)
             if cid in self.cameras and generation == self.generations[cid]:
                 self._publish_analysis(camera, None, bgr, time.monotonic())

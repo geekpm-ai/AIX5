@@ -72,6 +72,33 @@ def test_events_use_thumbnail_grid_cards():
     assert "已记录" not in INDEX
 
 
+def test_system_settings_show_network_addresses_and_ddns_controls():
+    assert 'id="networkAddresses"' in INDEX
+    assert 'id="remoteAccessForm"' in INDEX
+    assert 'id="remoteAccessProvider"' in INDEX
+    assert 'id="remoteAccessKeyId"' in INDEX
+    assert 'id="remoteAccessKeySecret"' in INDEX
+    assert 'id="remoteAccessKeyId"' in INDEX
+    assert 'id="remoteAccessKeySecret"' in INDEX
+    assert 'id="remoteAccessIpv4"' in INDEX
+    assert 'id="remoteAccessIpv6"' in INDEX
+    assert '每 5 分钟检查' in INDEX
+    assert '暂未接入' not in INDEX
+    assert "loadNetworkStatus()" in INDEX
+    assert "updateRemoteAccessNow()" in INDEX
+    assert 'data-system-section="systemSettingsInfo"' in INDEX
+    assert 'data-system-section="systemSettingsGeneral"' in INDEX
+    assert 'data-system-section="systemSettingsAccount"' in INDEX
+    assert 'data-system-section="systemSettingsRemote"' in INDEX
+    assert 'class="system-settings-section active"' in INDEX
+    assert '${address.kind}：</span>' in INDEX
+    assert '阿里云 DNS' in INDEX
+    assert '腾讯云 DNS' in INDEX
+    assert '华为云 DNS' in INDEX
+    assert 'GoDaddy' not in INDEX
+    assert 'Vercel' not in INDEX
+
+
 def test_rule_editor_supports_target_absence_durations():
     """Rules can alert after a selected target has been absent continuously."""
     assert 'id="ruleAbsenceSeconds"' in INDEX

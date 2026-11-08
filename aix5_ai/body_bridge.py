@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import ctypes
 import json
+import math
 import os
 import re
 import socket
@@ -158,39 +159,125 @@ def _iou(first, second):
 
 
 class PerCameraTracker:
-    """Keep MOT identity state separate while the BPU model is shared."""
+    """Keep MOT identity state separate while the BPU model is shared.
 
-    def __init__(self):
+    The TROS body node can emit slightly different rectangles for the same
+    person on adjacent frames. Matching on IoU alone caused a stationary
+    person to receive a new ID whenever the rectangle shrank or shifted a
+    little. Keep a short lived track after a missed frame and match by both
+    overlap and normalized center distance so detector jitter does not create
+    a new identity.
+    """
+
+    def __init__(self, max_missed: int = 8):
         self.next_id = 1
-        self.previous = []
+        self.max_missed = max_missed
+        self._tracks = {}
+
+    @staticmethod
+    def _center(box):
+        return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+    @classmethod
+    def _match_score(cls, current, previous):
+        overlap = _iou(current, previous)
+        current_center = cls._center(current)
+        previous_center = cls._center(previous)
+        dx = current_center[0] - previous_center[0]
+        dy = current_center[1] - previous_center[1]
+        previous_diagonal = math.hypot(
+            max(1.0, previous[2] - previous[0]),
+            max(1.0, previous[3] - previous[1]),
+        )
+        center_ratio = math.hypot(dx, dy) / previous_diagonal
+        # A rectangle can change size substantially while its center remains
+        # stable. Reject only clearly different objects, then let the overlap
+        # and center terms rank the remaining candidates.
+        if overlap < 0.02 and center_ratio > 1.25:
+            return None
+        center_score = max(0.0, 1.0 - center_ratio)
+        return overlap + 0.35 * center_score
+
+    @staticmethod
+    def _smooth(previous, current):
+        # Keep the detector's current rectangle for rendering, but use a
+        # lightly smoothed rectangle as the next matching anchor.
+        return [
+            previous[index] * 0.35 + current[index] * 0.65
+            for index in range(4)
+        ]
 
     def assign(self, detections):
         bodies = [item for item in detections if item["label"] == "body"]
-        used = set()
+        candidates = []
+        for body_index, body in enumerate(bodies):
+            for track_id, track in self._tracks.items():
+                score = self._match_score(body["bbox"], track["bbox"])
+                if score is not None:
+                    candidates.append((score, body_index, track_id))
+        # Greedy global ordering prevents the result order from deciding which
+        # two nearby people inherit each other's IDs.
+        candidates.sort(reverse=True)
+        matched_bodies = set()
+        matched_tracks = set()
         current = []
-        for body in bodies:
-            best, best_score = None, 0.30
-            for index, (track_id, previous_box) in enumerate(self.previous):
-                if index in used:
-                    continue
-                score = _iou(body["bbox"], previous_box)
-                if score > best_score:
-                    best, best_score = index, score
-            if best is None:
-                track_id = self.next_id
-                self.next_id += 1
-            else:
-                used.add(best)
-                track_id = self.previous[best][0]
+        for _score, body_index, track_id in candidates:
+            if body_index in matched_bodies or track_id in matched_tracks:
+                continue
+            body = bodies[body_index]
+            track = self._tracks[track_id]
             body["track_id"] = track_id
+            track["bbox"] = self._smooth(track["bbox"], body["bbox"])
+            track["missed"] = 0
+            matched_bodies.add(body_index)
+            matched_tracks.add(track_id)
             current.append((track_id, body["bbox"]))
-        self.previous = current
+
+        for body_index, body in enumerate(bodies):
+            if body_index in matched_bodies:
+                continue
+            track_id = self.next_id
+            self.next_id += 1
+            self._tracks[track_id] = {"bbox": list(body["bbox"]), "missed": 0}
+            body["track_id"] = track_id
+            matched_tracks.add(track_id)
+            current.append((track_id, body["bbox"]))
+
+        for track_id, track in list(self._tracks.items()):
+            if track_id not in matched_tracks:
+                track["missed"] += 1
+                if track["missed"] > self.max_missed:
+                    del self._tracks[track_id]
+
+        active = [
+            (track_id, track["bbox"])
+            for track_id, track in self._tracks.items()
+            if track["missed"] <= self.max_missed
+        ]
         for item in detections:
             if item["label"] == "body":
                 continue
-            center = ((item["bbox"][0] + item["bbox"][2]) / 2, (item["bbox"][1] + item["bbox"][3]) / 2)
-            containing = [pair for pair in current if pair[1][0] <= center[0] <= pair[1][2] and pair[1][1] <= center[1] <= pair[1][3]]
-            item["track_id"] = min(containing, key=lambda pair: _iou(item["bbox"], pair[1]))[0] if containing else 0
+            center = self._center(item["bbox"])
+            containing = [
+                pair
+                for pair in active
+                if pair[1][0] <= center[0] <= pair[1][2]
+                and pair[1][1] <= center[1] <= pair[1][3]
+            ]
+            if containing:
+                item["track_id"] = max(
+                    containing, key=lambda pair: _iou(item["bbox"], pair[1])
+                )[0]
+            elif active:
+                item["track_id"] = min(
+                    active,
+                    key=lambda pair: math.hypot(
+                        center[0] - self._center(pair[1])[0],
+                        center[1] - self._center(pair[1])[1],
+                    ),
+                )[0]
+            else:
+                item["track_id"] = 0
         return detections
 
 

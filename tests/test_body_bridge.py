@@ -60,6 +60,29 @@ def test_tracker_state_is_independent_per_bridge_camera():
     assert [item["track_id"] for item in first_b] == [1, 1]
 
 
+def test_tracker_keeps_id_when_rectangle_jitters_below_iou_threshold():
+    tracker = PerCameraTracker()
+    first = tracker.assign(
+        [{"label": "body", "bbox": [100, 100, 300, 500], "track_id": 0}]
+    )
+    # The tighter detector rectangle has IoU < 0.30 with the first one, but
+    # its center is unchanged and it is clearly the same person.
+    second = tracker.assign(
+        [{"label": "body", "bbox": [150, 200, 250, 400], "track_id": 0}]
+    )
+    assert first[0]["track_id"] == second[0]["track_id"] == 1
+
+
+def test_tracker_keeps_id_after_short_detection_gap():
+    tracker = PerCameraTracker()
+    tracker.assign([{"label": "body", "bbox": [100, 100, 300, 500], "track_id": 0}])
+    tracker.assign([])
+    resumed = tracker.assign(
+        [{"label": "body", "bbox": [104, 102, 304, 502], "track_id": 0}]
+    )
+    assert resumed[0]["track_id"] == 1
+
+
 def test_scale_result_restores_original_camera_coordinates():
     result = {
         "detections": [
